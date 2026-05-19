@@ -1,0 +1,539 @@
+#!/usr/bin/env bash
+# Common utilities shared across all scripts
+# Provides: validation, logging, data access, error handling, security
+# NOTE: This library still bootstraps config.sh as a compatibility bridge.
+# Callers should explicitly source config.sh before common.sh during migration
+# so removing this bootstrap later does not change behavior.
+
+if [[ -n "${_COMMON_SH_LOADED:-}" ]]; then
+    return 0
+fi
+readonly _COMMON_SH_LOADED=true
+
+#=============================================================================
+# Script Directory Resolution
+#=============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Handle case where script is in lib/ or root
+if [[ ! -f "$SCRIPT_DIR/lib/file_ops.sh" ]]; then
+    # Try one level up if we are in lib
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+
+if [[ -f "$SCRIPT_DIR/lib/file_ops.sh" ]]; then
+    source "$SCRIPT_DIR/lib/file_ops.sh"
+elif [[ -f "$SCRIPT_DIR/../lib/file_ops.sh" ]]; then
+    source "$SCRIPT_DIR/../lib/file_ops.sh"
+fi
+
+if [[ -f "$SCRIPT_DIR/lib/config.sh" ]]; then
+    source "$SCRIPT_DIR/lib/config.sh"
+elif [[ -f "$SCRIPT_DIR/../lib/config.sh" ]]; then
+    source "$SCRIPT_DIR/../lib/config.sh"
+fi
+
+#=============================================================================
+# Exit Code Constants
+#=============================================================================
+
+readonly EXIT_SUCCESS=0
+readonly EXIT_ERROR=1
+readonly EXIT_INVALID_ARGS=2
+readonly EXIT_FILE_NOT_FOUND=3
+readonly EXIT_PERMISSION=4
+readonly EXIT_SERVICE_ERROR=5
+readonly DEFAULT_LOG_ROTATE_MAX_BYTES=10485760
+
+#=============================================================================
+# Input Validation
+#=============================================================================
+
+# Validate that a value is a positive integer
+# Usage: validate_numeric "$value" "task number"
+validate_numeric() {
+    local value="$1"
+    local name="${2:-value}"
+
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "Error: $name must be a positive integer, got '$value'" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Validate that a value is within a range
+# Usage: validate_range "$value" 1 100 "spoon count"
+validate_range() {
+    local value="$1"
+    local min="$2"
+    local max="$3"
+    local name="${4:-value}"
+
+    validate_numeric "$value" "$name" || return 1
+
+    if (( value < min || value > max )); then
+        echo "Error: $name must be between $min and $max, got $value" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Validate that a file exists
+# Usage: validate_file_exists "$path" "config file"
+validate_file_exists() {
+    local path="$1"
+    local name="${2:-file}"
+
+    if [[ ! -f "$path" ]]; then
+        echo "Error: $name not found: $path" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Validate date format (YYYY-MM-DD)
+# Usage: validate_date_ymd "$value" "date"
+validate_date_ymd() {
+    local value="$1"
+    local name="${2:-date}"
+
+    if ! [[ "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        echo "Error: $name must be in YYYY-MM-DD format, got '$value'" >&2
+        return 1
+    fi
+    return 0
+}
+
+#=============================================================================
+# Todo Data Access
+#=============================================================================
+
+# Get a task line by number
+# Usage: get_todo_line 5
+get_todo_line() {
+    local task_num="$1"
+    local todo_file="${TODO_FILE:-}"
+
+    validate_numeric "$task_num" "task number" || return 1
+    if [[ -z "$todo_file" ]]; then
+        echo "Error: TODO_FILE is not set. Source scripts/lib/config.sh before calling get_todo_line." >&2
+        return 1
+    fi
+    validate_file_exists "$todo_file" "todo file" || return 1
+
+    sed -n "${task_num}p" "$todo_file"
+}
+
+# Get task text (without metadata) by line number.
+# Format: ID|DATE|text — returns field 3+
+# Usage: get_todo_text 5
+get_todo_text() {
+    local task_num="$1"
+    local line
+
+    line=$(get_todo_line "$task_num") || return 1
+    echo "$line" | cut -d'|' -f3-
+}
+
+# Get task date by line number.
+# Format: ID|DATE|text — returns field 2 (date)
+# Usage: get_todo_date 5
+get_todo_date() {
+    local task_num="$1"
+    local line
+
+    line=$(get_todo_line "$task_num") || return 1
+    echo "$line" | cut -d'|' -f2
+}
+
+# Get task ID by line number.
+# Format: ID|DATE|text — returns field 1 (ID)
+# Usage: get_todo_id 5
+get_todo_id() {
+    local task_num="$1"
+    local line
+
+    line=$(get_todo_line "$task_num") || return 1
+    echo "$line" | cut -d'|' -f1
+}
+
+# Count total tasks
+# Usage: count_todos
+count_todos() {
+    local todo_file="${TODO_FILE:-}"
+
+    if [[ -z "$todo_file" ]]; then
+        echo "0"
+        return
+    fi
+
+    if [[ -f "$todo_file" ]]; then
+        wc -l < "$todo_file" | tr -d ' '
+    else
+        echo "0"
+    fi
+}
+
+#=============================================================================
+# Todo Format Migration (ID|DATE|text)
+#=============================================================================
+
+# Get the next sequential task ID and increment the counter.
+# Requires: $TODO_ID_FILE (from config.sh)
+# Usage: id=$(next_todo_id)
+next_todo_id() {
+    local id_file="${TODO_ID_FILE:-}"
+    if [[ -z "$id_file" ]]; then
+        echo "Error: TODO_ID_FILE is not set. Source config.sh first." >&2
+        return 1
+    fi
+    mkdir -p "$(dirname "$id_file")" || return 1
+
+    local lock_dir="${id_file}.lock"
+    local attempts=0
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+        attempts=$((attempts + 1))
+        if [[ "$attempts" -ge 50 ]]; then
+            echo "Error: Could not acquire todo ID lock: $lock_dir" >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+
+    local next_id=1
+    if [[ -f "$id_file" ]]; then
+        next_id=$(cat "$id_file" 2>/dev/null || echo "1")
+        validate_numeric "$next_id" "task ID counter" >/dev/null 2>&1 || next_id=1
+    fi
+    local temp_file
+    temp_file=$(mktemp "${id_file}.XXXXXX") || {
+        rm -rf "$lock_dir"
+        return 1
+    }
+    chmod 600 "$temp_file" 2>/dev/null || true
+    printf '%s\n' "$((next_id + 1))" > "$temp_file" || {
+        rm -f "$temp_file"
+        rm -rf "$lock_dir"
+        return 1
+    }
+    mv "$temp_file" "$id_file" || {
+        rm -f "$temp_file"
+        rm -rf "$lock_dir"
+        return 1
+    }
+    rm -rf "$lock_dir"
+    printf '%s' "$next_id"
+}
+
+# Auto-migrate old format (DATE|text) to new format (ID|DATE|text).
+# Handles mixed files: only rows whose first field is a date get an ID prepended.
+# Rows that already start with a numeric ID are passed through unchanged.
+# Requires: $TODO_FILE, $TODO_ID_FILE (from config.sh)
+# Usage: ensure_todo_migrated
+ensure_todo_migrated() {
+    local todo_file="${TODO_FILE:-}"
+    [[ -n "$todo_file" ]] || return 0
+    [[ -s "$todo_file" ]] || return 0
+
+    # Quick check: if no row starts with a date, nothing to migrate
+    if ! grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}\|' "$todo_file"; then
+        return 0
+    fi
+
+    local migrated=""
+    local changed=false
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local first_field
+        first_field="${line%%|*}"
+        if [[ "$first_field" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            # Legacy row: prepend a new ID
+            local id
+            id=$(next_todo_id)
+            migrated="${migrated}${id}|${line}"$'\n'
+            changed=true
+        else
+            # Already has an ID (or unknown format) — keep as-is
+            migrated="${migrated}${line}"$'\n'
+        fi
+    done < "$todo_file"
+
+    if [[ "$changed" == "true" ]]; then
+        migrated="${migrated%$'\n'}"
+        if type atomic_write >/dev/null 2>&1; then
+            atomic_write "$migrated" "$todo_file" || {
+                echo "Error: Failed to migrate todo file to ID format" >&2
+                return 1
+            }
+        else
+            printf '%s\n' "$migrated" > "$todo_file"
+        fi
+    fi
+}
+
+#=============================================================================
+# Logging
+#=============================================================================
+
+if [[ -z "${SYSTEM_LOG_FILE:-}" ]]; then
+    if [[ -n "${SYSTEM_LOG:-}" ]]; then
+        SYSTEM_LOG_FILE="$SYSTEM_LOG"
+    else
+        echo "Error: SYSTEM_LOG_FILE is not set. Source scripts/lib/config.sh before common.sh." >&2
+        return 1
+    fi
+fi
+
+# Log a message with timestamp
+# Usage: log_message "info" "Script started"
+log_message() {
+    local level="$1"
+    local message="$2"
+    local script_name="${3:-$(basename "$0")}"
+    
+    # Ensure log directory exists
+    mkdir -p "$(dirname "$SYSTEM_LOG_FILE")"
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $script_name: $message" >> "$SYSTEM_LOG_FILE"
+}
+
+log_info()  { log_message "INFO" "$1" "${2:-}"; }
+log_warn()  { log_message "WARN" "$1" "${2:-}"; }
+log_error() { log_message "ERROR" "$1" "${2:-}"; }
+
+#=============================================================================
+# Error Handling
+#=============================================================================
+
+# Standard error exit with logging.
+# common.sh is always sourced, so this helper returns a non-zero status and
+# lets the caller decide whether strict mode or an explicit `return`/`exit`
+# should stop execution immediately.
+# Usage: die "Error message" [exit_code]
+die() {
+    local message="$1"
+    local exit_code="${2:-$EXIT_ERROR}"
+
+    log_error "$message"
+    echo "Error: $message" >&2
+
+    return "$exit_code"
+}
+
+# Check command exists
+# Usage: require_cmd "jq" "brew install jq"
+require_cmd() {
+    local cmd="$1"
+    local install_hint="${2:-}"
+
+    if ! command -v "$cmd" &>/dev/null; then
+        local msg="Required command not found: $cmd"
+        [[ -n "$install_hint" ]] && msg+=". Install with: $install_hint"
+        die "$msg" "$EXIT_FILE_NOT_FOUND"
+    fi
+}
+
+# Check file exists or die
+# Usage: require_file "$config_path" "config file"
+require_file() {
+    local file_path="$1"
+    local name="${2:-file}"
+
+    [[ -f "$file_path" ]] || die "$name not found: $file_path" "$EXIT_FILE_NOT_FOUND"
+}
+
+# Check directory exists or die
+# Usage: require_dir "$data_dir" "data directory"
+require_dir() {
+    local target_path="$1"
+    local name="${2:-directory}"
+
+    [[ -d "$target_path" ]] || die "$name not found: $target_path" "$EXIT_FILE_NOT_FOUND"
+}
+
+#=============================================================================
+# Log Rotation
+#=============================================================================
+
+# Rotate log if over size limit
+# Usage: rotate_log [log_file] [max_size_bytes]
+rotate_log() {
+    local log_file="${1:-$SYSTEM_LOG_FILE}"
+    local max_size="${2:-$DEFAULT_LOG_ROTATE_MAX_BYTES}"  # 10MB default
+
+    if [[ -f "$log_file" ]]; then
+        local size
+        # macOS vs Linux stat compatibility
+        if stat -f%z "$log_file" >/dev/null 2>&1; then
+            size=$(stat -f%z "$log_file")
+        else
+            size=$(stat -c%s "$log_file" 2>/dev/null || echo 0)
+        fi
+
+        if (( size > max_size )); then
+            mv "$log_file" "${log_file}.$(date +%Y%m%d_%H%M%S)"
+            # Keep only last 5 rotated logs
+            ls -t "${log_file}".* 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null || true
+            log_info "Log rotated: $log_file"
+        fi
+    fi
+}
+
+#=============================================================================
+# Security Utilities
+#=============================================================================
+
+# Sanitize user input for safe use in files
+# Usage: sanitized=$(sanitize_input "$user_input")
+sanitize_input() {
+    local input="$1"
+    # Strip delimiter characters so pipe-delimited records remain parseable.
+    input="${input//|/ }"
+    # Remove control characters except newline and tab
+    input=$(printf '%s' "$input" | tr -d '\000-\010\013\014\016-\037')
+    printf '%s' "$input"
+}
+
+# Sanitize user input and escape newlines for single-line storage fields.
+# Usage: stored=$(sanitize_for_storage "$user_input")
+sanitize_for_storage() {
+    local input="$1"
+    local sanitized
+
+    sanitized=$(sanitize_input "$input")
+    sanitized=${sanitized//$'\r'/ }
+    sanitized=${sanitized//$'\n'/\\n}
+
+    printf '%s' "$sanitized"
+}
+
+# Sanitize input and collapse to a single line (strip newlines)
+# Usage: clean=$(sanitize_single_line "$raw_input")
+sanitize_single_line() {
+    local value
+    value=$(sanitize_input "$1")
+    value=${value//$'\n'/ }
+    printf '%s' "$value"
+}
+
+# Validate path is safe (no traversal, within allowed base)
+# Usage: validated_path=$(validate_safe_path "$path" "$allowed_base")
+validate_safe_path() {
+    local file_path="$1"
+    local allowed_base="$2"
+
+    # Resolve to absolute path using python for portability (macOS/Linux)
+    local resolved
+    if command -v python3 &>/dev/null; then
+        resolved=$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$file_path" 2>/dev/null)
+    elif command -v python &>/dev/null; then
+        resolved=$(python -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$file_path" 2>/dev/null)
+    fi
+
+    if [[ -z "$resolved" ]]; then
+        # Fallback to simple shell resolution if python failed/missing
+        if [[ -d "$file_path" ]]; then
+            resolved=$(cd "$file_path" && pwd -P)
+        else
+            echo "Error: Invalid path: $file_path" >&2
+            return 1
+        fi
+    fi
+
+    # Resolve and validate base path
+    local resolved_base=""
+    if command -v python3 &>/dev/null; then
+        resolved_base=$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$allowed_base" 2>/dev/null)
+    elif command -v python &>/dev/null; then
+        resolved_base=$(python -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$allowed_base" 2>/dev/null)
+    fi
+
+    if [[ -z "$resolved_base" ]]; then
+        if [[ -d "$allowed_base" ]]; then
+            resolved_base=$(cd "$allowed_base" && pwd -P)
+        else
+            echo "Error: Invalid allowed base path: $allowed_base" >&2
+            return 1
+        fi
+    fi
+
+    # Enforce a real directory boundary check, not simple prefix matching.
+    if [[ "$resolved_base" == "/" ]]; then
+        :
+    elif [[ "$resolved" == "$resolved_base" || "$resolved" == "$resolved_base/"* ]]; then
+        :
+    else
+        echo "Error: Path outside allowed directory: $file_path" >&2
+        return 1
+    fi
+
+    printf '%s' "$resolved"
+}
+
+
+# Restore a previously saved trap or clear it.
+# Usage: restore_trap INT "$saved_int_trap"
+restore_trap() {
+    local signal_name="$1"
+    local saved_trap="$2"
+    if [[ -n "$saved_trap" ]]; then
+        eval "$saved_trap"
+    else
+        trap - "$signal_name"
+    fi
+}
+
+# Create temp file with restrictive permissions
+# Usage: temp_file=$(create_temp_file "prefix")
+create_temp_file() {
+    local prefix="${1:-dotfiles}"
+    local temp_file
+    temp_file=$(mktemp -t "${prefix}.XXXXXX") || die "Failed to create temp file"
+    chmod 600 "$temp_file"
+    printf '%s' "$temp_file"
+}
+
+#=============================================================================
+# Library Sourcing Helper
+#=============================================================================
+
+# Source a library file with error handling
+# Usage: require_lib "date_utils.sh"
+require_lib() {
+    local lib_name="$1"
+
+    # Try relative to current script first
+    local lib_path="$SCRIPT_DIR/lib/$lib_name"
+
+    if [[ ! -f "$lib_path" ]]; then
+        # Try relative to common.sh location
+        lib_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$lib_name"
+    fi
+
+    if [[ -f "$lib_path" ]]; then
+        source "$lib_path"
+    else
+        die "Required library not found: $lib_name" "$EXIT_FILE_NOT_FOUND"
+    fi
+}
+
+#=============================================================================
+# Path Validation
+#=============================================================================
+
+# Validate and canonicalize a path, ensuring it's within user's home directory
+# Usage: validated=$(validate_path "$path")
+# Returns: 0 on success (prints canonicalized path), 1 on failure (prints error)
+validate_path() {
+    local input_path="$1"
+    if [[ -z "$input_path" ]]; then
+        echo "Error: validate_path requires a path argument." >&2
+        return 1
+    fi
+
+    # Reuse validate_safe_path which handles realpath resolution and base checking
+    if ! validate_safe_path "$input_path" "$HOME"; then
+        return 1
+    fi
+}
