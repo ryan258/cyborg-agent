@@ -518,16 +518,11 @@ class DummyState:
         self.scan_summary = {'root': '/tmp/generated-repo'}
         self.code_improvement_plan = {'items': [{'id': 'improvement-1'}]}
         self.pending_repo_edits = []
-        self.gitnexus_skip = False
         self.link_recommendations = []
-
-class DummyGitNexusCLI:
-    available = False
 
 class DummyAgent:
     def __init__(self):
         self.state = DummyState()
-        self.gitnexus_cli = DummyGitNexusCLI()
         self.messages = []
         self.applied = []
 
@@ -539,9 +534,6 @@ class DummyAgent:
 
     def auto_prepare_repo_context(self):
         return None
-
-    def _gitnexus_decision_pending(self):
-        return False
 
     def build_code_improvement_plan(self):
         return None

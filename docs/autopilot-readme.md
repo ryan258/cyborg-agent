@@ -181,7 +181,6 @@ The same pipeline as `cyborg ingest`, but every decision point is auto-resolved:
 
 | Decision point | Manual mode | Autopilot mode |
 |---------------|-------------|---------------|
-| GitNexus approval | A-E prompt, waits | Auto-enhance small repos, auto-skip large/unavailable |
 | Rewrite candidates | A/B/C per match | Auto-selects "update" (safest) |
 | Draft targets | `/draft all` or pick keys | Always drafts all |
 | Link patches | `/patch-links 1 2 3` | Patches all recommendations |
@@ -257,7 +256,6 @@ Once resumed, you're in full interactive mode with all commands available.
 | `CYBORG_MODEL` | Model override (falls back through `CONTENT_MODEL` → `STRATEGY_MODEL`) |
 | `CYBORG_LAB_DIR` | Explicit path to the Cyborg Lab blog repo |
 | `CYBORG_DISABLE_AI` | Set to `true` to force deterministic mode (no `--build` or `--iterate`) |
-| `CYBORG_DISABLE_GITNEXUS` | Set to `true` to skip GitNexus entirely |
 | `CYBORG_MORPHLING_BRIEF` | Auto-set by the shell launcher — contains the Morphling pre-analysis. Not user-configured; injected into the session's AI context by `run_autopilot()` |
 
 ## Related Files

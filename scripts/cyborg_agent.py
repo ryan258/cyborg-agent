@@ -14,7 +14,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import shlex
 import sys
 import textwrap
@@ -22,8 +21,8 @@ import threading
 import urllib.error
 import urllib.request
 import uuid
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import asdict, dataclass, field, fields
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
@@ -60,7 +59,7 @@ except ImportError:  # pragma: no cover - readline is optional on some systems
 # --- Global constants ---
 
 # Bump this number when the session JSON shape changes.
-SESSION_VERSION = 3
+SESSION_VERSION = 4
 # Keep only the last N exchanges in the AI conversation window.
 MAX_CHAT_HISTORY = 8
 # Where we send AI requests (OpenRouter acts as a model gateway).
@@ -69,17 +68,6 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_TIMEOUT_SECONDS = 120
 # How long shell commands are allowed to run before we stop them.
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 30
-# GitNexus analyze can be slow on big repos, so it gets extra time.
-GITNEXUS_ANALYZE_TIMEOUT_SECONDS = 180
-# Cyborg uses the same pinned GitNexus package as the shell helper.
-GITNEXUS_PACKAGE = os.environ.get("CYBORG_GITNEXUS_PACKAGE", "gitnexus@1.4.7")
-GITNEXUS_NPX_COMMAND = ["npx", "--yes", f"--package={GITNEXUS_PACKAGE}", "gitnexus"]
-# If the GitNexus index is older than this, we call it "stale."
-GITNEXUS_STALE_HOURS = 72
-# Repos bigger than 100 MB of source/docs skip auto-enhancement.
-GITNEXUS_SIZE_THRESHOLD_BYTES = 100 * 1024 * 1024
-# How many execution flows / symbols to ask GitNexus for at once.
-GITNEXUS_QUERY_LIMIT = 4
 # Common places where the Cyborg Lab blog repo might live on disk.
 KNOWN_BLOG_PATHS = (
     Path.home() / "Projects" / "cyborg" / "my-ms-ai-blog",
@@ -264,7 +252,7 @@ CODE_IMPROVEMENT_CONTRACT = textwrap.dedent(
 
     Hard constraints:
     - Prioritize real source-repo improvements before documentation polish.
-    - Use the repo scan, GitNexus graph signals, and Morphling context when available.
+    - Use the native repo scan and Morphling context when available.
     - Prefer concrete, testable improvements over broad rewrites.
     - Keep scope tight: a few high-signal changes are better than a vague backlog.
     - When staging code edits, only touch the files explicitly allowed in the prompt.
@@ -277,7 +265,6 @@ HELP_TEXT = textwrap.dedent(
     Commands:
       /help                 Show this help
       /status               Show session status
-      /gitnexus <subcmd>    Manage GitNexus enhancement state
       /scan                 Scan the source repo or current directory
       /improve              Generate or refresh the source-repo improvement plan
       /patch-code [id]      Stage pending source-repo edits for the top improvement or a chosen ID
@@ -358,40 +345,6 @@ def short_preview(text: str, limit: int = 180) -> str:
         return collapsed
     return f"{collapsed[: limit - 3].rstrip()}..."
 
-
-def format_bytes(num_bytes: int) -> str:
-    """Turn a byte count into a human-friendly string like '2.3 MB'."""
-    units = ["B", "KB", "MB", "GB"]
-    value = float(num_bytes)
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
-            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
-        value /= 1024.0
-    return f"{num_bytes} B"
-
-
-def parse_iso_datetime(value: str) -> Optional[datetime]:
-    """Try to read an ISO date string.  Return None if it is bad."""
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-def is_source_or_doc_file(path: Path) -> bool:
-    """Return True if this file looks like source code or documentation."""
-    name = path.name
-    if path.suffix.lower() in SOURCE_FILE_SUFFIXES:
-        return True
-    if name in PROJECT_FILE_MARKERS or name in TEXT_FILE_NAMES:
-        return True
-    if name.lower().startswith("readme"):
-        return True
-    return "docs" in path.parts
-
-
 def section_type_from_content_path(path_value: str) -> Optional[str]:
     """Given a blog content path like 'content/log/foo.md', return the
     content type ('log').  Returns None if the path does not match any
@@ -415,44 +368,6 @@ def section_type_from_content_path(path_value: str) -> Optional[str]:
     if parts[1:3] == ("systems", "protocols"):
         return "protocol"
     return None
-
-
-def parse_gitnexus_list_output(output: str) -> list[dict[str, str]]:
-    """Parse the human-readable output of `gitnexus list` into a list
-    of dicts with keys like 'name', 'path', 'commit', etc.
-
-    The output uses indentation to separate repo names from their
-    details, so we track which repo block we are inside.
-    """
-    repos: list[dict[str, str]] = []
-    current: Optional[dict[str, str]] = None
-    for raw_line in output.splitlines():
-        line = raw_line.rstrip()
-        stripped = line.strip()
-        # A blank line ends the current repo block.
-        if not stripped:
-            if current:
-                repos.append(current)
-                current = None
-            continue
-        # Skip the header line like "Indexed Repositories (3)".
-        if stripped.startswith("Indexed Repositories"):
-            continue
-        # A line indented 2 spaces (but not 4) with no colon is a repo name.
-        if line.startswith("  ") and not line.startswith("    ") and ":" not in stripped:
-            if current:
-                repos.append(current)
-            current = {"name": stripped}
-            continue
-        # A line indented 4 spaces with a colon is a detail field.
-        if current and line.startswith("    ") and ":" in stripped:
-            key, value = stripped.split(":", 1)
-            current[key.lower()] = value.strip()
-    # Don't forget the last block if the output didn't end with a blank line.
-    if current:
-        repos.append(current)
-    return repos
-
 
 def detect_git_root(start_path: Path) -> Optional[Path]:
     """Ask git for the top-level directory.  Return None if this is
@@ -941,285 +856,6 @@ def load_blog_content_strategy(blog_root: Path) -> str:
     except OSError:
         return ""
 
-
-class GitNexusCli:
-    """Wrapper around the pinned npm GitNexus command-line tool.
-
-    GitNexus builds a knowledge graph of a repo's symbols and
-    execution flows.  This class runs it, reads its output, and
-    checks whether the index is healthy or needs a refresh.
-    """
-
-    def __init__(self) -> None:
-        # The user can turn off GitNexus entirely with an env var.
-        self.disabled = os.environ.get("CYBORG_DISABLE_GITNEXUS", "").lower() in {"1", "true", "yes"}
-        # Cache the repo list so we don't call `gitnexus list` twice.
-        self._repo_index_cache: Optional[list[dict[str, str]]] = None
-
-    @property
-    def available(self) -> bool:
-        """True if GitNexus is enabled and `npx` is available."""
-        return not self.disabled and shutil.which("npx") is not None
-
-    @staticmethod
-    def _status_path(line: str) -> str:
-        """Extract the repo-relative path from one `git status --short` line."""
-        raw = re.sub(r"^[ MADRCU?!]{1,2}\s+", "", line.rstrip())
-        if " -> " in raw:
-            raw = raw.split(" -> ", 1)[1].strip()
-        return raw
-
-    @classmethod
-    def _is_gitnexus_managed_path(cls, line: str) -> bool:
-        """True when a git-status line points at GitNexus-managed artifacts."""
-        path = cls._status_path(line)
-        if not path:
-            return False
-        return path.startswith(".gitnexus/") or path.startswith(".claude/skills/gitnexus/")
-
-    def _run(self, args: list[str], *, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT_SECONDS) -> str:
-        """Run a gitnexus subcommand and return its text output.
-        Raises RuntimeError if the command fails.
-        """
-        code, stdout, stderr = run_command_result([*GITNEXUS_NPX_COMMAND, *args], cwd=cwd, timeout=timeout)
-        if code != 0:
-            message = stderr or stdout or f"gitnexus {' '.join(args)} failed"
-            raise RuntimeError(message)
-        return stdout or stderr
-
-    def _run_json(self, args: list[str], *, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT_SECONDS) -> dict[str, Any]:
-        """Run a gitnexus subcommand and parse its output as JSON."""
-        output = self._run(args, cwd=cwd, timeout=timeout)
-        try:
-            return json.loads(output)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"GitNexus returned non-JSON output: {short_preview(output, 240)}") from exc
-
-    def _read_meta(self, repo_path: Path) -> dict[str, Any]:
-        """Read the local .gitnexus/meta.json file (if it exists).
-        Returns an empty dict when the file is missing or broken.
-        """
-        meta_path = repo_path / ".gitnexus" / "meta.json"
-        if not meta_path.exists():
-            return {}
-        try:
-            return json.loads(meta_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-
-    def _local_db_present(self, repo_path: Path) -> bool:
-        """True when the local GitNexus database exists for this repo."""
-        return (repo_path / ".gitnexus" / "lbug").exists()
-
-    def repo_entries(self, cwd: Path) -> list[dict[str, str]]:
-        """Get the list of repos that GitNexus has already indexed."""
-        if self._repo_index_cache is not None:
-            return self._repo_index_cache
-        try:
-            output = self._run(["list"], cwd=cwd)
-        except RuntimeError:
-            self._repo_index_cache = []
-            return self._repo_index_cache
-        self._repo_index_cache = parse_gitnexus_list_output(output)
-        return self._repo_index_cache
-
-    def repo_name_for_path(self, repo_path: Path) -> Optional[str]:
-        """Look up the GitNexus name for a repo by its disk path."""
-        for entry in self.repo_entries(repo_path):
-            if entry.get("path") == str(repo_path):
-                return entry.get("name")
-        return None
-
-    def tracked_source_docs_bytes(self, repo_path: Path) -> int:
-        """Add up the sizes of all tracked source and doc files.
-        We use this to decide if the repo is too large for GitNexus.
-        """
-        total = 0
-        output = run_command(["git", "ls-files"], cwd=repo_path, allow_failure=True)
-        for line in output.splitlines():
-            rel_path = line.strip()
-            if not rel_path:
-                continue
-            file_path = repo_path / rel_path
-            if not file_path.is_file() or not is_source_or_doc_file(file_path):
-                continue
-            try:
-                total += file_path.stat().st_size
-            except OSError:
-                continue
-        return total
-
-    def health_check(self, repo_path: Path, *, previous: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-        """Run a read-only check to find out if GitNexus is healthy,
-        stale, missing, or broken for this repo.  Returns a dict full
-        of flags the agent uses to decide what to show the user.
-
-        If `previous` is given (the status from the last saved session),
-        we also detect whether the repo changed since then.
-        """
-        status: dict[str, Any] = {
-            "enabled": not self.disabled,
-            "available": self.available,
-            "mode": "native",
-            "state": "disabled" if self.disabled else "unknown",
-            "decision_required": False,
-            "repo_path": str(repo_path),
-            "repo_name": None,
-            "configured": False,
-            "indexed": False,
-            "healthy": False,
-            "stale": False,
-            "stale_reasons": [],
-            "current_commit": "",
-            "indexed_commit": "",
-            "indexed_at": "",
-            "dirty": False,
-            "tracked_bytes": 0,
-            "too_large": False,
-            "embeddings_present": False,
-            "status_output": "",
-            "repo_changed_since_session": False,
-        }
-        git_root = detect_git_root(repo_path)
-        if not git_root:
-            status["state"] = "not-git"
-            status["enabled"] = False
-            return status
-        status["repo_path"] = str(git_root)
-        repo_path = git_root
-        status["current_commit"] = run_command(["git", "rev-parse", "HEAD"], cwd=repo_path, allow_failure=True)
-        git_status_output = run_command(["git", "status", "--short"], cwd=repo_path, allow_failure=True)
-        meaningful_status_lines = [line for line in git_status_output.splitlines() if not self._is_gitnexus_managed_path(line)]
-        status["dirty"] = bool(meaningful_status_lines)
-        status["tracked_bytes"] = self.tracked_source_docs_bytes(repo_path)
-        status["too_large"] = status["tracked_bytes"] > GITNEXUS_SIZE_THRESHOLD_BYTES
-        meta = self._read_meta(repo_path)
-        local_db_present = self._local_db_present(repo_path)
-        status["configured"] = bool(meta)
-        status["indexed_commit"] = str(meta.get("lastCommit", ""))
-        status["indexed_at"] = str(meta.get("indexedAt", ""))
-        stats = meta.get("stats", {}) if isinstance(meta, dict) else {}
-        status["embeddings_present"] = bool(stats.get("embeddings", 0))
-
-        if self.disabled:
-            status["state"] = "disabled"
-            return status
-        if not self.available:
-            status["state"] = "unavailable"
-            status["decision_required"] = True
-            status["stale_reasons"].append("GitNexus CLI is unavailable in this shell.")
-            return status
-
-        status["status_output"] = "local GitNexus health check (meta.json + .gitnexus/lbug + git state)"
-        status["repo_name"] = self.repo_name_for_path(repo_path) or repo_path.name
-        status["indexed"] = bool(meta) and local_db_present
-        if not status["configured"]:
-            status["stale_reasons"].append("GitNexus metadata is not configured in this repo.")
-        if status["configured"] and not local_db_present:
-            status["stale_reasons"].append("Local GitNexus database (.gitnexus/lbug) is missing.")
-        if not status["indexed"]:
-            status["stale_reasons"].append("This repo is not indexed yet.")
-        if status["indexed"] and status["current_commit"] and status["indexed_commit"] and status["current_commit"] != status["indexed_commit"]:
-            status["stale_reasons"].append("Current HEAD differs from the indexed commit.")
-        if status["dirty"]:
-            status["stale_reasons"].append("Tracked files changed since the last analyze.")
-        indexed_at = parse_iso_datetime(status["indexed_at"])
-        if indexed_at and indexed_at < datetime.now(timezone.utc) - timedelta(hours=GITNEXUS_STALE_HOURS):
-            status["stale_reasons"].append(f"The index is older than {GITNEXUS_STALE_HOURS} hours.")
-        if status["too_large"]:
-            status["stale_reasons"].append(
-                f"Tracked source/docs total {format_bytes(status['tracked_bytes'])}, above the {format_bytes(GITNEXUS_SIZE_THRESHOLD_BYTES)} enhancement threshold."
-            )
-        status["stale"] = bool(status["stale_reasons"]) and status["indexed"]
-        status["healthy"] = status["indexed"] and not status["stale_reasons"] and not status["too_large"]
-        status["decision_required"] = not status["healthy"]
-        if status["healthy"]:
-            status["state"] = "healthy"
-        elif status["too_large"]:
-            status["state"] = "too-large"
-        elif not status["indexed"]:
-            status["state"] = "not-indexed"
-        else:
-            status["state"] = "stale"
-        status["mode"] = "graph" if status["healthy"] else "native"
-
-        # Compare with the previous session's status to detect changes.
-        if previous:
-            prior_commit = str(previous.get("current_commit", ""))
-            prior_dirty = bool(previous.get("dirty"))
-            prior_indexed = str(previous.get("indexed_commit", ""))
-            status["repo_changed_since_session"] = bool(
-                prior_commit and (prior_commit != status["current_commit"] or prior_dirty != status["dirty"] or prior_indexed != status["indexed_commit"])
-            )
-            # If it was already flagged as changed, keep it flagged.
-            if previous.get("repo_changed_since_session"):
-                status["repo_changed_since_session"] = True
-        return status
-
-    def enhance(self, repo_path: Path, *, force: bool = False) -> dict[str, Any]:
-        """Run `gitnexus analyze` to build or refresh the repo index.
-
-        When `force` is True, the --force flag is passed so the index
-        is rebuilt from scratch even if it already exists.  If the
-        repo had embeddings before, we keep them.
-        """
-        meta_before = self._read_meta(repo_path)
-        preserve_embeddings = bool(meta_before.get("stats", {}).get("embeddings", 0))
-        args = ["analyze"]
-        if force:
-            args.append("--force")
-        if preserve_embeddings:
-            args.append("--embeddings")
-        args.append(".")
-        try:
-            output = self._run(args, cwd=repo_path, timeout=GITNEXUS_ANALYZE_TIMEOUT_SECONDS)
-        except RuntimeError as exc:
-            # If this was the very first analyze and it failed, clean up
-            # the partial .gitnexus folder so we don't leave garbage.
-            cleaned = False
-            if not meta_before:
-                code, _, _ = run_command_result([*GITNEXUS_NPX_COMMAND, "clean", "--force"], cwd=repo_path)
-                cleaned = code == 0
-            raise RuntimeError(f"{exc}\nCleanup attempted: {'yes' if cleaned else 'no'}") from exc
-        # Clear the cache so the next list call picks up fresh data.
-        self._repo_index_cache = None
-        return {
-            "output": output,
-            "preserved_embeddings": preserve_embeddings,
-        }
-
-    def query_summary(self, repo_path: Path, *, repo_name: Optional[str], search_query: str, goal: str, context: str) -> dict[str, Any]:
-        """Ask GitNexus for the repo's top execution flows, symbols,
-        and file definitions.  Returns an empty dict on failure so the
-        caller can fall back to native scanning.
-        """
-        if not repo_name:
-            return {}
-        try:
-            payload = self._run_json(
-                [
-                    "query",
-                    "--repo",
-                    repo_name,
-                    "-l",
-                    str(GITNEXUS_QUERY_LIMIT),
-                    "-g",
-                    goal,
-                    "-c",
-                    context,
-                    search_query,
-                ],
-                cwd=repo_path,
-            )
-        except RuntimeError:
-            return {}
-        return {
-            "processes": payload.get("processes", [])[:GITNEXUS_QUERY_LIMIT],
-            "process_symbols": payload.get("process_symbols", [])[:8],
-            "definitions": payload.get("definitions", [])[:8],
-        }
-
-
 @dataclass
 class SessionState:
     """Everything the agent needs to remember between commands.
@@ -1243,9 +879,8 @@ class SessionState:
     source_text: str = ""                # Free-text idea the user typed at launch
     article_text: str = ""               # Full text of the supporting article
     phase: str = "intake"                # Current pipeline stage (intake -> applied)
-    gitnexus_status: dict[str, Any] = field(default_factory=dict)      # Latest GitNexus health check
-    gitnexus_summary: dict[str, Any] = field(default_factory=dict)     # Graph query results
-    gitnexus_skip: bool = False          # True if user chose to skip GitNexus
+    repo_state: dict[str, Any] = field(default_factory=dict)          # Native git snapshot used to detect changes
+    repo_changed_since_session: bool = False                          # Preserved until the refreshed map is built
     intake_notes: list[str] = field(default_factory=list)              # Free-form notes from early phase
     planning_notes: list[str] = field(default_factory=list)            # Notes added after the map exists
     editorial_notes: list[str] = field(default_factory=list)           # Feedback on specific drafts
@@ -1495,7 +1130,7 @@ class CyborgAgent:
     """The main agent that drives the whole interactive session.
 
     It holds the session state, talks to the AI when available,
-    runs GitNexus commands, scans repos, builds content maps,
+    scans repos, builds content maps,
     generates drafts, and writes approved changes into the blog.
     """
 
@@ -1506,10 +1141,40 @@ class CyborgAgent:
         self.interactive = interactive
         self.blog_root = Path(state.blog_root)
         self.session_dir = Path(state.session_dir)
-        self.gitnexus_cli = GitNexusCli()
         self._cached_system_prompt: Optional[str] = None
 
     # --- Small helpers ---
+
+    def _current_repo_state(self, repo_path: Path) -> dict[str, Any]:
+        """Capture a small native git snapshot for resume-time change detection."""
+        git_root = detect_git_root(repo_path)
+        if not git_root:
+            return {}
+        status_output = run_command(["git", "status", "--short"], cwd=git_root, allow_failure=True)
+        status_lines = sorted(line for line in status_output.splitlines() if line.strip())
+        return {
+            "repo_path": str(git_root),
+            "current_commit": run_command(["git", "rev-parse", "HEAD"], cwd=git_root, allow_failure=True),
+            "dirty": bool(status_lines),
+            "git_status": status_lines,
+        }
+
+    def _refresh_repo_state(self, repo_path: Path) -> dict[str, Any]:
+        """Refresh native git state and preserve a detected change until `/map`."""
+        previous = self.state.repo_state if isinstance(self.state.repo_state, dict) else {}
+        current = self._current_repo_state(repo_path)
+        changed = False
+        if previous and current and previous.get("current_commit"):
+            previous_commit = str(previous.get("current_commit", ""))
+            current_commit = str(current.get("current_commit", ""))
+            commits_match = previous_commit == current_commit or current_commit.startswith(previous_commit)
+            changed = not commits_match
+            changed = changed or bool(previous.get("dirty")) != bool(current.get("dirty"))
+            if "git_status" in previous:
+                changed = changed or previous.get("git_status", []) != current.get("git_status", [])
+        self.state.repo_changed_since_session = self.state.repo_changed_since_session or changed
+        self.state.repo_state = current
+        return current
 
     def _repo_path(self) -> Optional[Path]:
         """Return the source repo path as a Path, or None."""
@@ -1528,150 +1193,6 @@ class CyborgAgent:
         except ValueError:
             return None
         return str(resolved.relative_to(repo_root.resolve()))
-
-    def _gitnexus_status(self) -> dict[str, Any]:
-        """Shortcut to get the latest GitNexus health-check dict."""
-        return self.state.gitnexus_status or {}
-
-    def _gitnexus_decision_pending(self) -> bool:
-        """True when GitNexus needs the user to say enhance or skip."""
-        status = self._gitnexus_status()
-        return bool(self.state.repo_path and not self.state.gitnexus_skip and status.get("decision_required"))
-
-    def _gitnexus_prompt_text(self) -> str:
-        """Build the message we show the user when GitNexus needs attention."""
-        status = self._gitnexus_status()
-        state = status.get("state")
-        tracked_size = format_bytes(int(status.get("tracked_bytes", 0)))
-        primary_action = "Approve the repo write step and run `gitnexus analyze` in this repo."
-        if state == "stale":
-            primary_action = "Approve the refresh and run `gitnexus analyze` so the graph matches the current repo state."
-        elif state == "too-large":
-            primary_action = "Approve the larger-repo analyze anyway and keep the index local to this repo."
-        elif state == "error":
-            primary_action = "Retry the enhancement flow for this repo."
-        base_lines = []
-        if state == "not-indexed":
-            base_lines.append("GitNexus is not configured here. I can initialize and analyze this repo to improve content mapping, cross-linking, and rewrite quality. Proceed?")
-        elif state == "stale":
-            base_lines.append("GitNexus is stale for this repo. I can refresh the index so the next content map reflects the current project state. Proceed?")
-        elif state == "too-large":
-            base_lines.append(
-                f"GitNexus enhancement is paused because tracked source/docs total {tracked_size}, above the {format_bytes(GITNEXUS_SIZE_THRESHOLD_BYTES)} threshold. Proceed anyway?"
-            )
-        elif state == "unavailable":
-            base_lines.append("GitNexus is not available in this shell, so I cannot enhance this repo until the CLI is reachable.")
-        elif state == "error":
-            base_lines.append("GitNexus health check failed. I can retry the enhancement flow, or you can continue with the native scan.")
-        else:
-            base_lines.append("GitNexus needs attention before I keep using it as the higher-confidence repo map.")
-        base_lines.extend(
-            [
-                "Planned GitNexus step:",
-                "- zero-write health check already completed",
-                "- run `gitnexus analyze` in this repo only if you approve",
-                "- preserve embeddings if they already exist",
-                "- keep `.gitnexus` local unless you explicitly decide otherwise",
-                "Options:",
-                "A. Explain the GitNexus plan in more detail.",
-                f"B. {primary_action}",
-                "C. Skip GitNexus and continue with native scanning only.",
-                "D. Show the current GitNexus status again.",
-                "E. Custom command or note.",
-                "Reply with A-E, or use `/gitnexus ...` directly.",
-            ]
-        )
-        if status.get("embeddings_present"):
-            base_lines.append("- embeddings already exist here, so a refresh will preserve them")
-        elif status.get("indexed"):
-            base_lines.append("- embeddings are not enabled here; I can recommend them later as an optional upgrade")
-        return "\n".join(base_lines)
-
-    def _gitnexus_status_lines(self) -> list[str]:
-        """Format the GitNexus status as lines for the /status display."""
-        status = self._gitnexus_status()
-        if not status:
-            return ["GitNexus: not checked yet"]
-        lines = [
-            f"GitNexus: {status.get('state', 'unknown')} ({status.get('mode', 'native')} mode)",
-            f"GitNexus repo: {status.get('repo_name') or '(none)'}",
-            f"GitNexus indexed commit: {status.get('indexed_commit') or '(none)'}",
-            f"GitNexus current commit: {status.get('current_commit') or '(none)'}",
-            f"GitNexus tracked source/docs: {format_bytes(int(status.get('tracked_bytes', 0)))}",
-            f"GitNexus embeddings: {'present' if status.get('embeddings_present') else 'not enabled'}",
-        ]
-        if status.get("stale_reasons"):
-            lines.append("GitNexus notes:")
-            lines.extend(f"- {reason}" for reason in status["stale_reasons"])
-        return lines
-
-    def _gitnexus_explain_text(self) -> str:
-        """Build the detailed explanation shown for /gitnexus explain."""
-        status = self._gitnexus_status()
-        lines = [
-            "GitNexus enhancement plan:",
-            "- detect repo health without writing anything",
-            "- if approved, run `gitnexus analyze` in the repo root",
-            "- preserve embeddings if they already exist",
-            "- merge GitNexus signals with the native scan, with GitNexus treated as higher confidence",
-            "- use the graph to improve execution-flow extraction, draft targeting, and strong-match rewrite prompts",
-            "- keep `.gitnexus` local-only unless you explicitly choose a different policy later",
-        ]
-        if status.get("too_large"):
-            lines.append(f"- current tracked source/docs size is {format_bytes(int(status.get('tracked_bytes', 0)))} so this exceeds the auto-enhancement threshold")
-        if status.get("stale_reasons"):
-            lines.append("Current blockers:")
-            lines.extend(f"- {reason}" for reason in status["stale_reasons"])
-        return "\n".join(lines)
-
-    def _gitnexus_search_query(self) -> str:
-        """Pick the best search string for the GitNexus graph query."""
-        candidates = [
-            self.state.repo_name or "",
-            extract_first_heading(self.state.article_text or "") or "",
-            self.state.source_text,
-        ]
-        for candidate in candidates:
-            cleaned = short_preview(candidate, 120).strip()
-            if cleaned:
-                return cleaned
-        return "core workflow execution path reusable artifact"
-
-    def _refresh_gitnexus_summary(self) -> None:
-        """Ask GitNexus for fresh execution-flow and symbol data."""
-        repo_path = self._repo_path()
-        status = self._gitnexus_status()
-        if not repo_path or not status.get("healthy"):
-            self.state.gitnexus_summary = {}
-            return
-        summary = self.gitnexus_cli.query_summary(
-            repo_path,
-            repo_name=status.get("repo_name"),
-            search_query=self._gitnexus_search_query(),
-            goal="Identify the repo's core execution flows, reusable artifacts, and update candidates for Cyborg Lab content.",
-            context="Cyborg Lab ingest session: merge GitNexus graph signals with native repo scanning for content mapping and rewrites.",
-        )
-        self.state.gitnexus_summary = summary
-
-    def refresh_gitnexus_status(self, *, announce: bool = False) -> dict[str, Any]:
-        """Re-run the GitNexus health check and update the session.
-        If announce=True and a decision is needed, print the prompt.
-        """
-        repo_path = self._repo_path()
-        if not repo_path:
-            self.state.gitnexus_status = {}
-            self.state.gitnexus_summary = {}
-            return {}
-        previous = self.state.gitnexus_status or None
-        status = self.gitnexus_cli.health_check(repo_path, previous=previous)
-        self.state.gitnexus_status = status
-        if status.get("healthy"):
-            self._refresh_gitnexus_summary()
-        else:
-            self.state.gitnexus_summary = {}
-        if announce and self._gitnexus_decision_pending():
-            self.assistant_say(self._gitnexus_prompt_text())
-        return status
 
     # --- Blog awareness ---
 
@@ -1768,18 +1289,14 @@ class CyborgAgent:
         return self._cached_system_prompt
 
     def auto_prepare_repo_context(self) -> None:
-        """Called at session start: check GitNexus health and scan the
-        repo if needed.  Pauses if the user needs to make a choice.
-        """
+        """Load blog contracts and refresh native repo context at session start."""
         self._load_blog_awareness()
         repo_path = self._repo_path()
         if not repo_path:
             return
-        status = self.refresh_gitnexus_status(announce=True)
-        if self._gitnexus_decision_pending():
-            return
-        if not self.state.scan_summary or status.get("repo_changed_since_session"):
-            if status.get("repo_changed_since_session") and self.state.scan_summary:
+        self._refresh_repo_state(repo_path)
+        if not self.state.scan_summary or self.state.repo_changed_since_session:
+            if self.state.repo_changed_since_session and self.state.scan_summary:
                 self.assistant_say(
                     "Repo state changed since the last saved session. I’m refreshing the repo scan now. Rebuild the map with `/map` when you want updated rewrite choices."
                 )
@@ -1909,7 +1426,14 @@ class CyborgAgent:
             f"Rewrite recommendations: {len(self.state.rewrite_recommendations)}",
             f"Active review target: {review_target}",
         ]
-        lines.extend(self._gitnexus_status_lines())
+        if self.state.repo_state:
+            lines.extend(
+                [
+                    f"Repo commit: {self.state.repo_state.get('current_commit') or '(none)'}",
+                    f"Repo dirty: {'yes' if self.state.repo_state.get('dirty') else 'no'}",
+                    f"Repo changed since session: {'yes' if self.state.repo_changed_since_session else 'no'}",
+                ]
+            )
         return lines
 
     def code_improvement_markdown(self) -> str:
@@ -1961,13 +1485,6 @@ class CyborgAgent:
             self.state.content_map.get("summary", "No summary generated."),
             "",
         ]
-        if self.state.gitnexus_summary:
-            lines.extend(["## GitNexus Signals", ""])
-            for process in self.state.gitnexus_summary.get("processes", [])[:4]:
-                lines.append(f"- Flow: {process.get('summary', 'unknown flow')} ({process.get('step_count', '?')} steps)")
-            for definition in self.state.gitnexus_summary.get("definitions", [])[:4]:
-                lines.append(f"- Definition: {definition.get('name', 'unknown')} -> `{definition.get('filePath', '')}`")
-            lines.append("")
         lines.extend(["## Proposed Pages", ""])
         for item in items:
             lines.append(f"- `{item['key']}` [{item['type']}] -> `{item['path']}`")
@@ -2031,20 +1548,13 @@ class CyborgAgent:
             self.assistant_say("No repo path is active. Add notes or restart with `cyborg ingest --repo <path>` if you want repo-backed scanning.")
             return
 
-        if self._gitnexus_decision_pending():
-            self.assistant_say(self._gitnexus_prompt_text())
-            return
-
         repo_path = Path(self.state.repo_path)
         git_root = detect_git_root(repo_path)
         scan_root = git_root or repo_path
         self.state.repo_path = str(scan_root)
         self.state.repo_name = scan_root.name
 
-        status = self.refresh_gitnexus_status()
-        if self._gitnexus_decision_pending():
-            self.assistant_say(self._gitnexus_prompt_text())
-            return
+        self._refresh_repo_state(scan_root)
 
         files = self._list_files(scan_root, git_root is not None)
         language_counts = self._language_counts(files)
@@ -2106,15 +1616,6 @@ class CyborgAgent:
             "## Language Mix",
             "",
         ]
-        if status:
-            summary_lines.extend(
-                [
-                    f"- GitNexus: {status.get('state', 'unknown')} ({status.get('mode', 'native')} mode)",
-                    f"- GitNexus Repo Name: {status.get('repo_name') or '(none detected)'}",
-                    f"- GitNexus Indexed Commit: {status.get('indexed_commit') or '(none)'}",
-                    "",
-                ]
-            )
         for ext, count in sorted(language_counts.items(), key=lambda item: (-item[1], item[0])):
             summary_lines.append(f"- {ext}: {count}")
 
@@ -2127,12 +1628,6 @@ class CyborgAgent:
         if recent_commits:
             summary_lines.extend(["", "## Recent Commits", ""])
             summary_lines.extend(f"- {line}" for line in recent_commits.splitlines())
-        if self.state.gitnexus_summary:
-            summary_lines.extend(["", "## GitNexus Signals", ""])
-            for process in self.state.gitnexus_summary.get("processes", [])[:4]:
-                summary_lines.append(f"- Flow: {process.get('summary', 'unknown flow')} ({process.get('step_count', '?')} steps)")
-            for definition in self.state.gitnexus_summary.get("definitions", [])[:4]:
-                summary_lines.append(f"- Definition: {definition.get('name', 'unknown')} -> `{definition.get('filePath', '')}`")
         if duplicate_candidates:
             summary_lines.extend(["", "## Cyborg Lab Candidates", ""])
             for candidate in duplicate_candidates:
@@ -2148,7 +1643,6 @@ class CyborgAgent:
                     f"- Root: {scan_root}",
                     f"- Files: {len(files)}",
                     f"- Duplicate candidates: {len(duplicate_candidates)}",
-                    f"- GitNexus: {status.get('state', 'unknown')} ({status.get('mode', 'native')} mode)",
                     "Run `/map` when you want the first content graph.",
                 ]
             )
@@ -2239,7 +1733,7 @@ class CyborgAgent:
         matches to offer the user update/iteration-log/merge choices.
         Returns the existing list unchanged when nothing new happened.
         """
-        if not self.state.gitnexus_status.get("repo_changed_since_session"):
+        if not self.state.repo_changed_since_session:
             return self.state.rewrite_recommendations
         recommendations: list[dict[str, Any]] = []
         for candidate in self.state.duplicate_candidates:
@@ -2273,7 +1767,7 @@ class CyborgAgent:
         user to choose update, iteration-log, or merge for each.
         """
         prompt_recommendations = recommendations if recommendations is not None else self._pending_rewrite_recommendations()
-        lines = ["Strong existing-page matches detected after the refreshed map:"]
+        lines = ["Strong existing-page matches detected after the current repo map:"]
         single_choice_mode = len(prompt_recommendations) == 1
         for rec in prompt_recommendations:
             choice_prefix = "" if single_choice_mode else str(rec["id"])
@@ -2372,7 +1866,7 @@ class CyborgAgent:
             self.state.rewrite_choices[target_path] = "iteration-log"
             self.save()
             self.assistant_say(
-                f"The refreshed session will preserve `{target_path}` and route the next narrative update into `{log_item['path']}`."
+                f"The current session will preserve `{target_path}` and route the next narrative update into `{log_item['path']}`."
             )
             return
 
@@ -2390,13 +1884,8 @@ class CyborgAgent:
         """Generate or refresh the content map (the set of proposed
         new pages).  Tries AI first; falls back to heuristics.
         """
-        if self._gitnexus_decision_pending():
-            self.assistant_say(self._gitnexus_prompt_text())
-            return
         if not self.state.scan_summary and self.state.repo_path:
             self.scan_repo()
-            if self._gitnexus_decision_pending():
-                return
 
         content_map: dict[str, Any]
         if self.ai_client.enabled:
@@ -2410,8 +1899,7 @@ class CyborgAgent:
 
         self.state.content_map = content_map
         self.state.rewrite_recommendations = self._build_rewrite_recommendations()
-        if self.state.gitnexus_status.get("repo_changed_since_session"):
-            self.state.gitnexus_status["repo_changed_since_session"] = False
+        self.state.repo_changed_since_session = False
         self.state.phase = "mapped"
         self.save()
         self.assistant_say(self.content_map_markdown().strip())
@@ -2434,8 +1922,6 @@ class CyborgAgent:
             "intake_notes": self.state.intake_notes,
             "scan_summary": self.state.scan_summary,
             "duplicate_candidates": self.state.duplicate_candidates,
-            "gitnexus_status": self.state.gitnexus_status,
-            "gitnexus_summary": self.state.gitnexus_summary,
             "available_content_types": archetype_types,
         }
         response = self.ai_client.chat_json(
@@ -2490,8 +1976,6 @@ class CyborgAgent:
         repo_title = title_from_slug(repo_slug)
         track_name = self._infer_track()
         track_segment = track_slug(track_name)
-        top_flow = next(iter(self.state.gitnexus_summary.get("processes", [])), {})
-        flow_hint = top_flow.get("summary", "").strip()
         log_title = extract_first_heading(self.state.article_text or "") or f"Field Report: Building {repo_title}"
         workflow_title = f"{repo_title} Workflow"
         artifact_title = f"{repo_title} Command Sheet"
@@ -2513,8 +1997,7 @@ class CyborgAgent:
                 "type": "workflow",
                 "title": workflow_title,
                 "path": f"content/workflows/{track_segment}/{repo_slug}-workflow.md",
-                "why": "Execution-first page that teaches the repeatable path through the repo from setup to successful output."
-                + (f" GitNexus highlighted `{flow_hint}` as a core execution flow." if flow_hint else ""),
+                "why": "Execution-first page that teaches the repeatable path through the repo from setup to successful output.",
                 "voice_mode": "documentation",
                 "depends_on": [],
                 "existing_page_actions": [],
@@ -2593,8 +2076,6 @@ class CyborgAgent:
             f"Start with a four-page core set around {repo_title}: project, workflow, artifact, and log. "
             "Add a reference page only if the repo has enough command density or navigation surface to justify it."
         )
-        if flow_hint:
-            summary += f" GitNexus surfaced `{flow_hint}` as a likely high-signal flow to anchor the workflow page."
         return self._normalize_content_map(
             {
                 "summary": summary,
@@ -2787,16 +2268,7 @@ class CyborgAgent:
         """Return the best current repo files to target for a small improvement."""
         sample_code = [self._normalize_repo_relative_path(path) for path in self.state.scan_details.get("sample_code", [])]
         sample_code = [path for path in sample_code if path]
-        graph_files: list[str] = []
-        for entry in self.state.gitnexus_summary.get("process_symbols", [])[:6]:
-            normalized = self._normalize_repo_relative_path(entry.get("filePath"))
-            if normalized and normalized not in graph_files:
-                graph_files.append(normalized)
-        for entry in self.state.gitnexus_summary.get("definitions", [])[:6]:
-            normalized = self._normalize_repo_relative_path(entry.get("filePath"))
-            if normalized and normalized not in graph_files:
-                graph_files.append(normalized)
-        return (graph_files or sample_code)[:limit]
+        return sample_code[:limit]
 
     def _decorate_iteration_plan(self, plan: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
         """Attach iterate-mode metadata to the first improvement item."""
@@ -2824,13 +2296,8 @@ class CyborgAgent:
         if not self.state.repo_path:
             self.assistant_say("No repo path is active. Start with `cyborg ingest --repo <path>` or `/scan` in a project folder.")
             return
-        if self._gitnexus_decision_pending():
-            self.assistant_say(self._gitnexus_prompt_text())
-            return
         if not self.state.scan_summary:
             self.scan_repo()
-            if self._gitnexus_decision_pending():
-                return
 
         iteration_task = self._active_iteration_task()
         if iteration_task:
@@ -2864,8 +2331,6 @@ class CyborgAgent:
             "repo_remote": self.state.repo_remote,
             "repo_scan": self.state.scan_summary,
             "scan_details": self.state.scan_details,
-            "gitnexus_status": self.state.gitnexus_status,
-            "gitnexus_summary": self.state.gitnexus_summary,
             "morphling_context": self.state.article_text,
         }
         response = self.ai_client.chat_json(
@@ -2892,7 +2357,7 @@ class CyborgAgent:
                 - Prioritize code changes over documentation changes.
                 - Prefer 1-3 high-signal improvements, not a laundry list.
                 - Every improvement must name concrete target files.
-                - Use GitNexus execution flows when they help identify the core path.
+                - Use the native scan to identify the core path.
 
                 Source payload:
                 {json.dumps(payload, indent=2)}
@@ -2914,8 +2379,6 @@ class CyborgAgent:
             "repo_remote": self.state.repo_remote,
             "repo_scan": self.state.scan_summary,
             "scan_details": self.state.scan_details,
-            "gitnexus_status": self.state.gitnexus_status,
-            "gitnexus_summary": self.state.gitnexus_summary,
             "iteration_task": task,
         }
         response = self.ai_client.chat_json(
@@ -2963,15 +2426,10 @@ class CyborgAgent:
         sample_code = [path for path in sample_code if path]
         manifest_paths = [self._normalize_repo_relative_path(path) for path in self.state.scan_details.get("manifests", [])]
         manifest_paths = [path for path in manifest_paths if path]
-        flow = next(iter(self.state.gitnexus_summary.get("processes", [])), {})
-        flow_hint = flow.get("summary", "").strip()
-
         items: list[dict[str, Any]] = []
         core_targets = self._suggest_code_targets(limit=2) or sample_code[:2]
         if core_targets:
             title = "Harden the core execution flow"
-            if flow_hint:
-                title = f"Harden core flow: {flow_hint}"
             items.append(
                 {
                     "id": 1,
@@ -3036,8 +2494,6 @@ class CyborgAgent:
             )
 
         summary = "Prioritize a small set of source-repo improvements before drafting documentation."
-        if flow_hint:
-            summary += f" GitNexus highlighted `{flow_hint}` as the best place to start."
         return {
             "summary": summary,
             "items": items[:3],
@@ -3293,9 +2749,6 @@ class CyborgAgent:
         """Create a phased plan that tells the user what order to
         draft and publish pages.  Tries AI first; falls back.
         """
-        if self._gitnexus_decision_pending():
-            self.assistant_say(self._gitnexus_prompt_text())
-            return
         if not self.state.content_map:
             self.assistant_say("Generate the content map first with `/map`.")
             return
@@ -3321,8 +2774,6 @@ class CyborgAgent:
             "planning_notes": self.state.planning_notes,
             "duplicate_candidates": self.state.duplicate_candidates,
             "repo_scan": self.state.scan_summary,
-            "gitnexus_status": self.state.gitnexus_status,
-            "gitnexus_summary": self.state.gitnexus_summary,
             "rewrite_recommendations": self.state.rewrite_recommendations,
         }
         response = self.ai_client.chat_json(
@@ -3358,10 +2809,8 @@ class CyborgAgent:
         """
         items = self.state.content_map.get("items", [])
         ordered = [item["key"] for item in items if item["type"] in {"workflow", "artifact", "project", "log", "reference", "stack", "protocol"}]
-        gitnexus_hint = next(iter(self.state.gitnexus_summary.get("processes", [])), {}).get("summary", "")
         return {
-            "summary": "Lock the graph first, then draft the highest-signal reusable pages before the narrative log. Keep duplicate risk low by reviewing existing-page recommendations before writing anything into the live repo."
-            + (f" GitNexus highlighted `{gitnexus_hint}` as a strong execution-flow anchor." if gitnexus_hint else ""),
+            "summary": "Lock the content graph first, then draft the highest-signal reusable pages before the narrative log. Keep duplicate risk low by reviewing existing-page recommendations before writing anything into the live repo.",
             "phases": [
                 {
                     "name": "Lock Scope",
@@ -3400,9 +2849,6 @@ class CyborgAgent:
         """Generate near-publishable markdown drafts for the given
         content-map keys (or all keys if 'all' is passed).
         """
-        if self._gitnexus_decision_pending():
-            self.assistant_say(self._gitnexus_prompt_text())
-            return
         if not self.state.publishing_plan:
             self.assistant_say("Generate the publishing plan first with `/plan`.")
             return
@@ -3462,8 +2908,6 @@ class CyborgAgent:
             "repo_name": self.state.repo_name,
             "repo_remote": self.state.repo_remote,
             "repo_scan": self.state.scan_summary,
-            "gitnexus_status": self.state.gitnexus_status,
-            "gitnexus_summary": self.state.gitnexus_summary,
             "article_text": self.state.article_text,
             "source_text": self.state.source_text,
             "planning_notes": self.state.planning_notes,
@@ -3534,9 +2978,7 @@ class CyborgAgent:
                 "repo_name": self.state.repo_name,
                 "repo_remote": self.state.repo_remote,
                 "repo_scan": self.state.scan_summary,
-                "gitnexus_status": self.state.gitnexus_status,
-                "gitnexus_summary": self.state.gitnexus_summary,
-                "article_text": self.state.article_text,
+                        "article_text": self.state.article_text,
                 "source_text": self.state.source_text,
                 "planning_notes": self.state.planning_notes,
                 "rewrite_choices": self.state.rewrite_choices,
@@ -4005,75 +3447,6 @@ class CyborgAgent:
             return "- Add sibling links after the first draft pass."
         return "\n".join(f"- [{title}]({path})" for title, path in sibling_links)
 
-    # --- GitNexus commands ---
-
-    def handle_gitnexus_command(self, args: list[str]) -> None:
-        """Route /gitnexus subcommands: status, explain, skip,
-        enhance, and refresh.
-        """
-        subcommand = args[0] if args else "status"
-        repo_path = self._repo_path()
-        if not repo_path:
-            self.assistant_say("No repo is active in this session, so GitNexus is not relevant here.")
-            return
-        if subcommand == "status":
-            self.refresh_gitnexus_status()
-            self.assistant_say("\n".join(self._gitnexus_status_lines()))
-            return
-        if subcommand == "explain":
-            self.refresh_gitnexus_status()
-            self.assistant_say(self._gitnexus_explain_text())
-            return
-        if subcommand == "skip":
-            self.state.gitnexus_skip = True
-            self.save()
-            self.assistant_say("GitNexus is skipped for this session. I’ll continue with native repo scanning.")
-            if not self.state.scan_summary:
-                self.scan_repo()
-            return
-        if subcommand in {"enhance", "refresh"}:
-            status = self.refresh_gitnexus_status()
-            if status.get("state") == "not-git":
-                self.assistant_say("This source is not a git repo, so GitNexus enhancement does not apply.")
-                return
-            if not self.gitnexus_cli.available:
-                self.assistant_say("GitNexus CLI is unavailable here. Use `/gitnexus skip` to continue natively or make the CLI available first.")
-                return
-            try:
-                result = self.gitnexus_cli.enhance(repo_path, force=subcommand == "refresh" or bool(status.get("stale")))
-            except RuntimeError as exc:
-                self.assistant_say(
-                    "\n".join(
-                        [
-                            "GitNexus enhancement failed.",
-                            str(exc),
-                            "Options:",
-                            "A. Explain the GitNexus plan again.",
-                            "B. Retry the enhancement flow.",
-                            "C. Skip GitNexus and continue with native scanning.",
-                            "D. Show the current GitNexus status again.",
-                            "E. Custom command or note (`/quit` is also available).",
-                        ]
-                    )
-                )
-                return
-            self.state.gitnexus_skip = False
-            refreshed = self.refresh_gitnexus_status()
-            self.save()
-            self.assistant_say(
-                "\n".join(
-                    [
-                        "GitNexus enhancement completed.",
-                        f"- Repo: {refreshed.get('repo_name') or repo_path.name}",
-                        f"- State: {refreshed.get('state')}",
-                        f"- Embeddings preserved: {'yes' if result.get('preserved_embeddings') else 'no'}",
-                        "I’ll use graph-enhanced scanning from here.",
-                    ]
-                )
-            )
-            self.scan_repo()
-            return
-        self.assistant_say("Usage: /gitnexus status|enhance|refresh|skip|explain")
 
     # --- Link and review commands ---
 
@@ -4393,24 +3766,6 @@ class CyborgAgent:
 
     # --- Free-text note handling ---
 
-    def _handle_gitnexus_letter_choice(self, normalized: str) -> bool:
-        """Accept short A-E answers when a GitNexus decision is pending."""
-        if normalized in {"a"}:
-            self.handle_gitnexus_command(["explain"])
-            return True
-        if normalized in {"b", "yes", "y", "proceed", "approve"}:
-            self.handle_gitnexus_command(["enhance"])
-            return True
-        if normalized in {"c", "skip", "no", "n"}:
-            self.handle_gitnexus_command(["skip"])
-            return True
-        if normalized in {"d", "status"}:
-            self.handle_gitnexus_command(["status"])
-            return True
-        if normalized in {"e"}:
-            self.assistant_say("Custom GitNexus choice: use `/gitnexus explain`, `/gitnexus enhance`, `/gitnexus skip`, `/gitnexus status`, or type the extra detail you want.")
-            return True
-        return False
 
     def _handle_rewrite_letter_choice(self, note: str) -> bool:
         """Accept ``A`` / ``1B`` style rewrite choices after /map."""
@@ -4452,17 +3807,11 @@ class CyborgAgent:
     def handle_note(self, note: str) -> None:
         """Process a line that is NOT a slash-command.
 
-        If a GitNexus decision is pending and the user typed a short
-        choice like A-E, yes, or skip, route it there.  If a review
-        target is active, treat the text as editorial feedback.
+        If a review target is active, treat the text as editorial feedback.
         Otherwise save it as an intake or planning note and optionally
         ask the AI for guidance.
         """
         self.user_said(note)
-        normalized = note.strip().lower()
-        if self._gitnexus_decision_pending():
-            if self._handle_gitnexus_letter_choice(normalized):
-                return
         if self.state.active_review_key:
             self.revise_active_draft(note)
             return
@@ -4476,7 +3825,7 @@ class CyborgAgent:
             self.state.planning_notes.append(expanded_note)
         self.save()
 
-        if self.ai_client.enabled and not self._gitnexus_decision_pending():
+        if self.ai_client.enabled:
             try:
                 response = self.ai_client.chat_text(
                     f"{self._build_system_prompt()}\n\n{INTAKE_GUIDANCE}",
@@ -4503,10 +3852,6 @@ class CyborgAgent:
             except RuntimeError as exc:
                 self.assistant_say(f"Saved the note. AI guidance is unavailable right now.\nReason: {exc}")
                 return
-
-        if self._gitnexus_decision_pending():
-            self.assistant_say(f"Saved the note. {self._gitnexus_prompt_text()}")
-            return
 
         if self.state.pending_repo_edits:
             next_step = "Use `/apply code --yes` to write the staged source-repo edits, or `/patch-code <id>` to replace them with a different improvement."
@@ -4762,6 +4107,21 @@ def load_session(blog_root: Path, session_id: Optional[str], *, interactive: boo
     if not session_file.exists():
         raise ValueError(f"Session file not found: {session_file}")
     data = json.loads(session_file.read_text(encoding="utf-8"))
+    if "repo_state" not in data:
+        scan_details = data.get("scan_details", {})
+        recent_commits = scan_details.get("recent_commits", []) if isinstance(scan_details, dict) else []
+        prior_commit = str(recent_commits[0]).split(maxsplit=1)[0] if recent_commits else ""
+        prior_status = scan_details.get("git_status", []) if isinstance(scan_details, dict) else []
+        data["repo_state"] = {
+            "repo_path": data.get("repo_path", ""),
+            "current_commit": prior_commit,
+            "dirty": bool(prior_status),
+            "git_status": prior_status,
+        }
+    data.setdefault("repo_changed_since_session", False)
+    data["version"] = SESSION_VERSION
+    supported_fields = {item.name for item in fields(SessionState)}
+    data = {key: value for key, value in data.items() if key in supported_fields}
     return SessionState(**data)
 
 
@@ -4846,33 +4206,6 @@ def run_autopilot(
     # --- Phase 1: Repo context ---
     def _phase_repo_context() -> None:
         agent.auto_prepare_repo_context()
-
-        # In autopilot, auto-resolve GitNexus decisions instead of waiting.
-        if agent._gitnexus_decision_pending():
-            status = agent._gitnexus_status()
-            gn_state = status.get("state")
-            if gn_state in {"not-indexed", "stale"} and agent.gitnexus_cli.available:
-                tracked = int(status.get("tracked_bytes", 0))
-                if tracked <= GITNEXUS_SIZE_THRESHOLD_BYTES:
-                    agent.assistant_say("Autopilot: auto-enhancing GitNexus (repo is small enough).")
-                    agent.handle_gitnexus_command(["enhance"])
-                else:
-                    agent.assistant_say("Autopilot: skipping GitNexus (repo is large).")
-                    agent.handle_gitnexus_command(["skip"])
-            else:
-                agent.assistant_say("Autopilot: skipping GitNexus.")
-                agent.handle_gitnexus_command(["skip"])
-
-        # If GitNexus is still pending after our best attempt (e.g. the
-        # enhance succeeded but the status flipped to "stale" immediately),
-        # force-skip so downstream phases don't keep bailing out.
-        if agent._gitnexus_decision_pending():
-            agent.assistant_say("Autopilot: forcing GitNexus skip to avoid stale loop.")
-            agent.state.gitnexus_skip = True
-            agent.save()
-
-        # auto_prepare_repo_context returns early when a GitNexus
-        # decision was pending, so the scan may not have happened yet.
         if not agent.state.scan_summary and agent.state.repo_path:
             agent.scan_repo()
 
@@ -4933,15 +4266,13 @@ def run_autopilot(
                         f"Autopilot: verification needed {fix_rounds} AI fix round(s). "
                         "Those follow-up changes stay in your working tree; iterate mode does not auto-commit them."
                     )
-                agent.state.gitnexus_skip = True
                 agent.assistant_say("Autopilot: rescanning repo after the verified iterate change...")
                 agent.scan_repo()
             elif os.environ.get("CYBORG_AUTO_APPLY_CODE", "").lower() in {"1", "true", "yes"} and agent.state.pending_repo_edits:
                 agent.assistant_say("Autopilot: applying staged source-repo edits before documentation...")
                 agent.apply_changes("code", assume_yes=True)
                 if agent.state.repo_path:
-                    agent.state.gitnexus_skip = True
-                    agent.assistant_say("Autopilot: rescanning repo after code changes (native scan until the next GitNexus refresh)...")
+                    agent.assistant_say("Autopilot: rescanning repo after code changes...")
                     agent.scan_repo()
 
     if not _phase("code improvements", _phase_code_improvements):
@@ -5171,7 +4502,7 @@ def run_repl(agent: CyborgAgent) -> int:
                 return 0
             continue
 
-        if line.startswith("/") or line in {"help", "status", "gitnexus", "scan", "improve", "patch-code", "map", "plan", "draft", "links", "review", "rewrite", "show", "apply", "quit", "exit"}:
+        if line.startswith("/") or line in {"help", "status", "scan", "improve", "patch-code", "map", "plan", "draft", "links", "review", "rewrite", "show", "apply", "quit", "exit"}:
             command, args = parse_command(line)
             if command in {"quit", "exit"}:
                 agent.assistant_say("Session saved. Use `cyborg resume %s` to reopen it later." % agent.state.session_id)
@@ -5180,8 +4511,6 @@ def run_repl(agent: CyborgAgent) -> int:
                 agent.assistant_say(HELP_TEXT)
             elif command == "status":
                 agent.assistant_say("\n".join(agent.status_lines()))
-            elif command == "gitnexus":
-                agent.handle_gitnexus_command(args)
             elif command == "scan":
                 agent.scan_repo()
             elif command == "improve":

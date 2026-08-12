@@ -1,15 +1,14 @@
 #!/usr/bin/env bats
 # test_cyborg.sh - Integration tests for the Cyborg Lab ingest agent.
 # These tests check the full round-trip: scan, map, plan, draft, apply,
-# resume, GitNexus integration, link-only apply, and error handling.
+# resume, native git change detection, link-only apply, and error handling.
 
 # Pull in shared test helpers (temp dirs, assertions, etc.).
 load helpers/test_helpers.sh
 load helpers/assertions.sh
 
 # setup() runs before every single test.
-# It builds a throwaway sandbox with fake repos, a fake blog,
-# and a fake "npx gitnexus" so tests never touch real data.
+# It builds a throwaway sandbox with fake repos and a fake blog.
 setup() {
     setup_test_environment
 
@@ -21,20 +20,12 @@ setup() {
     export SOURCE_REPO="$TEST_DIR/source-repo"
     # Repo name with special characters to test safe string handling.
     export SPECIAL_REPO="$TEST_DIR/rockit++[1]"
-    # A real git repo used by GitNexus-related tests.
+    # A real git repo used by resume-time change-detection tests.
     export GIT_SOURCE_REPO="$TEST_DIR/git-source-repo"
-    # Folder that holds our fake "npx" script.
-    export FAKE_BIN="$TEST_DIR/fake-bin"
-    # A log file the fake npx writes to so tests can check what was called.
-    export FAKE_GITNEXUS_LOG="$TEST_DIR/gitnexus.log"
-
     # Create all the folders the agent expects to find.
-    mkdir -p "$DOTFILES_DIR/bin" "$DOTFILES_DIR/scripts" "$DOTFILES_DIR/scripts/lib" "$DOTFILES_DIR/zsh" "$FAKE_BIN"
+    mkdir -p "$DOTFILES_DIR/bin" "$DOTFILES_DIR/scripts" "$DOTFILES_DIR/scripts/lib" "$DOTFILES_DIR/zsh"
     mkdir -p "$BLOG_DIR/content/log" "$BLOG_DIR/content/projects" "$BLOG_DIR/content/workflows" "$BLOG_DIR/content/artifacts" "$BLOG_DIR/content/reference" "$BLOG_DIR/drafts" "$SESSION_ROOT"
     mkdir -p "$SOURCE_REPO" "$SPECIAL_REPO" "$GIT_SOURCE_REPO"
-    # Start with an empty log file.
-    : > "$FAKE_GITNEXUS_LOG"
-
     # Copy the real agent code into the sandbox so tests run against it.
     cp "$BATS_TEST_DIRNAME/../bin/cyborg" "$DOTFILES_DIR/bin/cyborg"
     cp "$BATS_TEST_DIRNAME/../scripts/cyborg_agent.py" "$DOTFILES_DIR/scripts/cyborg_agent.py"
@@ -80,11 +71,11 @@ EOF
 print("special")
 EOF
 
-    # --- Build a real git repo for GitNexus tests ---
+    # --- Build a real git repo for change-detection tests ---
     cat > "$GIT_SOURCE_REPO/README.md" <<'EOF'
 # Git Source Repo
 
-Repo used to exercise the GitNexus-enhanced cyborg flow.
+Repo used to exercise the native repo-aware Cyborg flow.
 EOF
 
     cat > "$GIT_SOURCE_REPO/tool.py" <<'EOF'
@@ -156,151 +147,6 @@ tags:
 git-source-repo already appears here as a maintained workflow page.
 EOF
 
-    # --- Fake npx script ---
-    # This stands in for the real "npx gitnexus" CLI.
-    # It writes to a log so tests can check which commands were called,
-    # and it returns canned responses that look like real GitNexus output.
-cat > "$FAKE_BIN/npx" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-while [[ "${1:-}" == --* ]]; do
-    shift || true
-done
-
-# We only pretend to be gitnexus; reject anything else.
-if [[ "${1:-}" != "gitnexus" ]]; then
-    echo "fake npx only handles gitnexus in this test harness" >&2
-    exit 1
-fi
-if [[ "${FAKE_GITNEXUS_UNAVAILABLE:-false}" == "true" ]]; then
-    echo "gitnexus unavailable in fixture" >&2
-    exit 127
-fi
-shift  # Remove "gitnexus" so $1 is now the subcommand.
-
-command_name="${1:-}"
-shift || true  # Remove the subcommand; the rest are arguments.
-
-# Figure out the git root and current commit for realistic output.
-repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-repo_name="$(basename "$repo_root")"
-current_commit="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo "")"
-meta_path="$repo_root/.gitnexus/meta.json"
-
-# Record every call so tests can verify what happened.
-if [[ -n "${FAKE_GITNEXUS_LOG:-}" ]]; then
-    printf 'gitnexus %s %s\n' "$command_name" "$*" >> "$FAKE_GITNEXUS_LOG"
-fi
-
-case "$command_name" in
-    status)
-        # If there is no git repo, say so.
-        if [[ ! -d "$repo_root/.git" ]]; then
-            echo "Not a git repository."
-            exit 0
-        fi
-        # If the index file does not exist, the repo is not indexed yet.
-        if [[ ! -f "$meta_path" ]]; then
-            echo "Repository not indexed."
-            echo "Run: gitnexus analyze"
-            exit 0
-        fi
-        # Otherwise, report a healthy, up-to-date index.
-        echo "Repository: $repo_root"
-        echo "Indexed: 3/16/2026, 9:00:00 AM"
-        echo "Indexed commit: ${current_commit:0:7}"
-        echo "Current commit: ${current_commit:0:7}"
-        echo "Status: ✅ up-to-date"
-        ;;
-    analyze)
-        # Create a fake index with some stats the agent can read.
-        mkdir -p "$repo_root/.gitnexus"
-        mkdir -p "$repo_root/.gitnexus/lbug"
-        indexed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        cat > "$meta_path" <<JSON
-{
-  "repoPath": "$repo_root",
-  "lastCommit": "$current_commit",
-  "indexedAt": "$indexed_at",
-  "stats": {
-    "files": 2,
-    "nodes": 9,
-    "edges": 18,
-    "communities": 2,
-    "processes": 1
-  }
-}
-JSON
-        echo "Indexed $repo_root"
-        ;;
-    list)
-        # Show one indexed repo if the index exists, zero otherwise.
-        if [[ -f "$meta_path" ]]; then
-            cat <<LIST
-
-  Indexed Repositories (1)
-
-  $repo_name
-    Path:    $repo_root
-    Indexed: 3/16/2026, 9:00:00 AM
-    Commit:  ${current_commit:0:7}
-    Stats:   2 files, 9 symbols, 18 edges
-    Clusters:   2
-    Processes:  1
-LIST
-        else
-            echo
-            echo "  Indexed Repositories (0)"
-        fi
-        ;;
-    query)
-        # Return a canned graph query result with one execution flow.
-        cat <<JSON
-{
-  "processes": [
-    {
-      "id": "proc_demo",
-      "summary": "CLI Main -> Output Artifact",
-      "priority": 0.91,
-      "symbol_count": 2,
-      "process_type": "cross_community",
-      "step_count": 4
-    }
-  ],
-  "process_symbols": [
-    {
-      "id": "Function:tool.py:main",
-      "name": "main",
-      "filePath": "tool.py",
-      "startLine": 1,
-      "endLine": 1,
-      "module": "Scripts",
-      "process_id": "proc_demo",
-      "step_index": 1
-    }
-  ],
-  "definitions": [
-    {
-      "id": "File:tool.py",
-      "name": "tool.py",
-      "filePath": "tool.py"
-    }
-  ]
-}
-JSON
-        ;;
-    clean)
-        # Delete the local index folder.
-        rm -rf "$repo_root/.gitnexus"
-        ;;
-    *)
-        echo "Unsupported fake gitnexus command: $command_name" >&2
-        exit 1
-        ;;
-esac
-EOF
-    chmod +x "$FAKE_BIN/npx"
 }
 
 # teardown() runs after every test to clean up the sandbox.
@@ -376,7 +222,8 @@ teardown() {
   "updated_at": "2026-03-24T00:00:00Z",
   "blog_root": "$BLOG_DIR",
   "session_dir": "$legacy_session_dir",
-  "cwd": "$SOURCE_REPO"
+  "cwd": "$SOURCE_REPO",
+  "retired_extension_state": {"enabled": true}
 }
 EOF
 
@@ -386,56 +233,18 @@ EOF
     [[ "$output" == *"Session: $legacy_session_id"* ]]
 }
 
-# ---- GitNexus approval gate ----
 
-# Test: on a git repo the agent should pause for GitNexus approval.
-# Choosing "skip" should let the native scan proceed normally.
-@test "cyborg ingest pauses for GitNexus approval on git repos and can skip to native scan" {
-    run bash -lc "cd '$GIT_SOURCE_REPO' && printf '/gitnexus skip\n/map\n/quit\n' | env PATH='$FAKE_BIN:$PATH' DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' ingest 'focus on the repeatable path'"
+# ---- Native git repo flow ----
+
+@test "cyborg ingest scans git repos directly and reports native repo state" {
+    run bash -lc "cd '$GIT_SOURCE_REPO' && printf '/status
+/quit
+' | env DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' ingest 'focus on the repeatable path'"
 
     [ "$status" -eq 0 ]
-    # The agent should have asked for permission first.
-    [[ "$output" == *"GitNexus is not configured here. I can initialize and analyze this repo to improve content mapping, cross-linking, and rewrite quality. Proceed?"* ]]
-    # After skipping, native scanning should still work.
-    [[ "$output" == *"GitNexus is skipped for this session."* ]]
     [[ "$output" == *"Repo scan complete."* ]]
-}
-
-# Test: approve GitNexus enhancement and verify graph signals show up.
-@test "cyborg ingest can enhance a git repo and surface GitNexus graph signals" {
-    run bash -lc "cd '$GIT_SOURCE_REPO' && printf '/gitnexus enhance\n/map\n/status\n/quit\n' | env PATH='$FAKE_BIN:$PATH' DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' ingest 'focus on graph signals'"
-
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"GitNexus enhancement completed."* ]]
-    # The fake query result should appear in the content map.
-    [[ "$output" == *"Flow: CLI Main -> Output Artifact"* ]]
-    [[ "$output" == *"GitNexus: healthy (graph mode)"* ]]
-}
-
-# Test: a first-time enhance should NOT use --force (only refresh does).
-@test "cyborg first-time gitnexus enhance does not pass --force" {
-    run bash -lc "cd '$GIT_SOURCE_REPO' && printf '/gitnexus enhance\n/quit\n' | env PATH='$FAKE_BIN:$PATH' DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' ingest 'focus on the graph bootstrap'"
-
-    [ "$status" -eq 0 ]
-    # The log should NOT contain --force.
-    run grep -n 'gitnexus analyze --force' "$FAKE_GITNEXUS_LOG"
-    [ "$status" -eq 1 ]
-
-    # But it should contain a plain "analyze ." call.
-    run grep -n 'gitnexus analyze \.' "$FAKE_GITNEXUS_LOG"
-    [ "$status" -eq 0 ]
-}
-
-@test "cyborg ingest accepts letter choices for pending GitNexus approval" {
-    run bash -lc "cd '$GIT_SOURCE_REPO' && printf 'B\n/quit\n' | env PATH='$FAKE_BIN:$PATH' DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' ingest 'focus on graph signals'"
-
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"A. Explain the GitNexus plan in more detail."* ]]
-    [[ "$output" == *"B. Approve the repo write step and run \`gitnexus analyze\` in this repo."* ]]
-    [[ "$output" == *"GitNexus enhancement completed."* ]]
-
-    run grep -n 'gitnexus analyze \.' "$FAKE_GITNEXUS_LOG"
-    [ "$status" -eq 0 ]
+    [[ "$output" == *"Repo commit:"* ]]
+    [[ "$output" == *"Repo dirty: no"* ]]
 }
 
 # ---- Rewrite modes on resume ----
@@ -444,7 +253,7 @@ EOF
 # detect the change and offer "update", "iteration-log", or "merge".
 @test "cyborg resume after repo changes offers rewrite modes for strong matches" {
     # Create the first session and immediately quit.
-    run bash -lc "cd '$GIT_SOURCE_REPO' && printf '/gitnexus enhance\n/quit\n' | env PATH='$FAKE_BIN:$PATH' DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' ingest 'capture the initial workflow'"
+    run bash -lc "cd '$GIT_SOURCE_REPO' && printf '/quit\n' | env DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' ingest 'capture the initial workflow'"
     [ "$status" -eq 0 ]
 
     session_id=$(basename "$(find "$SESSION_ROOT" -mindepth 1 -maxdepth 1 -type d | head -n 1)")
@@ -458,20 +267,18 @@ EOF
         git commit -qm "iteration"
     )
 
-    # Resume the session. The agent should detect staleness, rebuild,
+    # Resume the session. The agent should detect the commit change, rebuild,
     # and offer a rewrite choice for the existing workflow page.
-    run bash -lc "printf '/gitnexus refresh\n/map\n/rewrite 1 update\n/quit\n' | env PATH='$FAKE_BIN:$PATH' DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' resume '$session_id'"
+    run bash -lc "printf '/map\n/rewrite 1 update\n/quit\n' | env DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' resume '$session_id'"
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"GitNexus is stale for this repo. I can refresh the index so the next content map reflects the current project state. Proceed?"* ]]
-    [[ "$output" == *"GitNexus enhancement completed."* ]]
-    [[ "$output" == *"Strong existing-page matches detected after the refreshed map:"* ]]
+    [[ "$output" == *"Strong existing-page matches detected after the current repo map:"* ]]
     [[ "$output" == *"legacy-iteration-workflow.md"* ]]
     [[ "$output" == *"will now update"* ]]
 }
 
 @test "cyborg resume accepts compact letter choices for rewrite decisions" {
-    run bash -lc "cd '$GIT_SOURCE_REPO' && printf '/gitnexus enhance\n/quit\n' | env PATH='$FAKE_BIN:$PATH' DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' ingest 'capture the initial workflow'"
+    run bash -lc "cd '$GIT_SOURCE_REPO' && printf '/quit\n' | env DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' ingest 'capture the initial workflow'"
     [ "$status" -eq 0 ]
 
     session_id=$(basename "$(find "$SESSION_ROOT" -mindepth 1 -maxdepth 1 -type d | head -n 1)")
@@ -484,24 +291,24 @@ EOF
         git commit -qm "letter-choice"
     )
 
-    run bash -lc "printf 'B\n/map\nA\n/quit\n' | env PATH='$FAKE_BIN:$PATH' DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' resume '$session_id'"
+    run bash -lc "printf '/map\nA\n/quit\n' | env DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' resume '$session_id'"
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"Reply with \`A\`, \`B\`, \`C\`, \`D\`, or \`E\`"* ]]
     [[ "$output" == *"will now update"* ]]
 }
 
-# Test: even while a GitNexus decision is pending, /show should still
-# work so the user can inspect a previously-generated draft.
-@test "cyborg resume keeps /show available while a GitNexus decision is pending" {
+# Test: /show remains available after a repo change so a saved draft
+# can be inspected before rebuilding the map.
+@test "cyborg resume keeps /show available after a repo change" {
     # Create a session that already has a draft.
-    run bash -lc "cd '$GIT_SOURCE_REPO' && printf '/gitnexus enhance\n/map\n/plan\n/draft workflow-main\n/quit\n' | env PATH='$FAKE_BIN:$PATH' DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' ingest 'capture a draft before resume'"
+    run bash -lc "cd '$GIT_SOURCE_REPO' && printf '/map\n/plan\n/draft workflow-main\n/quit\n' | env DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' ingest 'capture a draft before resume'"
     [ "$status" -eq 0 ]
 
     session_id=$(basename "$(find "$SESSION_ROOT" -mindepth 1 -maxdepth 1 -type d | head -n 1)")
     [ -n "$session_id" ]
 
-    # Push a new commit so the index goes stale.
+    # Push a new commit so native resume detection sees the change.
     (
         cd "$GIT_SOURCE_REPO"
         printf '\nprint(\"pending\")\n' >> tool.py
@@ -509,12 +316,11 @@ EOF
         git commit -qm "pending"
     )
 
-    # Resume and ask to show the draft without resolving GitNexus first.
-    run bash -lc "printf '/show workflow-main\n/quit\n' | env PATH='$FAKE_BIN:$PATH' DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' resume '$session_id'"
+    # Resume and ask to show the draft before rebuilding the map.
+    run bash -lc "printf '/show workflow-main\n/quit\n' | env DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' resume '$session_id'"
 
     [ "$status" -eq 0 ]
-    # The stale warning should appear, but the draft still prints.
-    [[ "$output" == *"GitNexus is stale for this repo."* ]]
+    # The draft still prints after the automatic native rescan.
     [[ "$output" == *'type: "workflow"'* ]]
     [[ "$output" == *'title: "Git Source Repo Workflow"'* ]]
 }
@@ -522,7 +328,7 @@ EOF
 # Test: after choosing a rewrite mode and then rebuilding the map,
 # the rewrite prompt should NOT appear a second time.
 @test "cyborg rewrite prompt does not repeat after a choice and a fresh map rebuild" {
-    run bash -lc "cd '$GIT_SOURCE_REPO' && printf '/gitnexus enhance\n/quit\n' | env PATH='$FAKE_BIN:$PATH' DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' ingest 'capture the initial workflow'"
+    run bash -lc "cd '$GIT_SOURCE_REPO' && printf '/quit\n' | env DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' ingest 'capture the initial workflow'"
     [ "$status" -eq 0 ]
 
     session_id=$(basename "$(find "$SESSION_ROOT" -mindepth 1 -maxdepth 1 -type d | head -n 1)")
@@ -536,18 +342,18 @@ EOF
     )
 
     # Choose "update" for recommendation #1, then rebuild the map again.
-    run bash -lc "printf '/gitnexus refresh\n/map\n/rewrite 1 update\n/map\n/quit\n' | env PATH='$FAKE_BIN:$PATH' DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' resume '$session_id'"
+    run bash -lc "printf '/map\n/rewrite 1 update\n/map\n/quit\n' | env DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' resume '$session_id'"
 
     [ "$status" -eq 0 ]
     # The "Strong existing-page matches" message should appear only once.
-    prompt_count=$(printf '%s' "$output" | grep -o 'Strong existing-page matches detected after the refreshed map:' | wc -l | tr -d ' ')
+    prompt_count=$(printf '%s' "$output" | grep -o 'Strong existing-page matches detected after the current repo map:' | wc -l | tr -d ' ')
     [ "$prompt_count" -eq 1 ]
 }
 
 # Test: choosing "iteration-log" should keep the original log item
 # and add a brand-new "log-iteration" entry in the session JSON.
 @test "cyborg iteration-log rewrite keeps the original log item and adds a separate iteration target" {
-    run bash -lc "cd '$GIT_SOURCE_REPO' && printf '/gitnexus enhance\n/map\n/plan\n/draft log-main\n/quit\n' | env PATH='$FAKE_BIN:$PATH' DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' ingest 'capture the original narrative log'"
+    run bash -lc "cd '$GIT_SOURCE_REPO' && printf '/map\n/plan\n/draft log-main\n/quit\n' | env DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' ingest 'capture the original narrative log'"
     [ "$status" -eq 0 ]
 
     session_id=$(basename "$(find "$SESSION_ROOT" -mindepth 1 -maxdepth 1 -type d | head -n 1)")
@@ -560,7 +366,7 @@ EOF
         git commit -qm "iteration-log"
     )
 
-    run bash -lc "printf '/gitnexus refresh\n/map\n/rewrite 1 iteration-log\n/quit\n' | env PATH='$FAKE_BIN:$PATH' DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' resume '$session_id'"
+    run bash -lc "printf '/map\n/rewrite 1 iteration-log\n/quit\n' | env DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' resume '$session_id'"
 
     [ "$status" -eq 0 ]
     session_json="$SESSION_ROOT/$session_id/session.json"
@@ -613,10 +419,9 @@ EOF
     [[ "$output" == *"Applied the selected pending changes into the Cyborg Lab repo."* ]]
 }
 
-# Test: 'cyborg auto' on a git repo auto-skips GitNexus when CLI is
-# unavailable and still completes the full pipeline.
-@test "cyborg auto skips GitNexus when CLI is unavailable" {
-    run bash -lc "env PATH='$FAKE_BIN:$PATH' FAKE_GITNEXUS_UNAVAILABLE=true DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true CYBORG_DISABLE_GITNEXUS=false '$DOTFILES_DIR/bin/cyborg' auto --repo '$GIT_SOURCE_REPO' --yes"
+# Test: 'cyborg auto' handles a real git repo with the native scan.
+@test "cyborg auto handles git repos with the native scan" {
+    run bash -lc "env DOTFILES_DIR='$DOTFILES_DIR' CYBORG_LAB_DIR='$BLOG_DIR' CYBORG_DISABLE_AI=true '$DOTFILES_DIR/bin/cyborg' auto --repo '$GIT_SOURCE_REPO' --yes"
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"Cyborg autopilot session:"* ]]

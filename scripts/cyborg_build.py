@@ -123,7 +123,6 @@ FIX_SNAPSHOT_MAX_TOTAL_CHARS = 120000
 
 _FIX_SNAPSHOT_EXCLUDED_DIRS = {
     ".git",
-    ".gitnexus",
     ".venv",
     ".venv-codex",
     "__pycache__",
