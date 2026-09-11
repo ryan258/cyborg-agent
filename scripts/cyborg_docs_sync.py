@@ -43,8 +43,8 @@ MAX_README_CHARS = 6000
 MAX_DIFF_CHARS = 18000
 MAX_PAGE_CHARS = 14000
 MAX_NOTES_CHARS = 4000
-ALLOWED_PAGE_TYPES = frozenset({"project", "workflow", "artifact", "log", "reference", "stack", "protocol"})
-LAST_TESTED_TYPES = frozenset({"project", "workflow", "artifact", "stack", "protocol"})
+ALLOWED_PAGE_TYPES = frozenset({"project", "workflow", "artifact", "blog", "reference", "stack", "prompt", "lesson", "log", "protocol"})
+LAST_TESTED_TYPES = frozenset({"project", "workflow", "artifact", "stack", "prompt", "protocol"})
 LAST_GENERATED_TYPES = frozenset({"artifact"})
 STOP_WORDS = frozenset({
     "a", "an", "the", "and", "or", "but", "for", "nor", "so", "yet",
@@ -928,10 +928,18 @@ def merge_page_markdown(
     elif not merged.get("date"):
         merged["date"] = today
     merged["lastmod"] = today
-    if spec.page_type in LAST_TESTED_TYPES or "last_tested" in merged:
-        merged["last_tested"] = today
-    if spec.page_type in LAST_GENERATED_TYPES or "last_generated" in merged:
-        merged["last_generated"] = today
+    # Physical execution evidence dates:
+    # Model-generated frontmatter (new_frontmatter) must NEVER create new verification dates!
+    # Only preserve genuine historical dates already present in existing_frontmatter.
+    if existing_frontmatter.get("last_tested"):
+        merged["last_tested"] = existing_frontmatter["last_tested"]
+    else:
+        merged.pop("last_tested", None)
+
+    if existing_frontmatter.get("last_generated"):
+        merged["last_generated"] = existing_frontmatter["last_generated"]
+    else:
+        merged.pop("last_generated", None)
     if spec.draft is not None:
         merged["draft"] = spec.draft
     elif "draft" in existing_frontmatter:

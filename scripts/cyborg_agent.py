@@ -136,10 +136,8 @@ TEXT_FILE_NAMES = {"Makefile", "justfile", "Dockerfile"}
 WORKFLOW_TRACKS = (
     "AI Frameworks",
     "Brain Fog Systems",
-    "Decision Systems",
     "Keyboard Efficiency",
     "Productivity Systems",
-    "Thinking Frameworks",
 )
 # Each content type maps to a Hugo directory, a unit description,
 # and a tone note so the AI (or heuristic) knows how to write it.
@@ -159,18 +157,18 @@ CONTENT_TYPES: dict[str, dict[str, str]] = {
         "unit": "One reusable deliverable",
         "tone": "copy-ready output page",
     },
-    "log": {
-        "dir": "content/log",
+    "blog": {
+        "dir": "content/blog",
         "unit": "One tested observation or sourced point of view",
         "tone": "dated field report or narrative article",
     },
     "reference": {
-        "dir": "content/reference",
+        "dir": "content/library",
         "unit": "One fast lookup surface",
         "tone": "index or lookup page",
     },
-    "protocol": {
-        "dir": "content/systems/protocols",
+    "prompt": {
+        "dir": "content/prompts",
         "unit": "One deterministic prompt contract",
         "tone": "prompt/system instruction page",
     },
@@ -178,6 +176,21 @@ CONTENT_TYPES: dict[str, dict[str, str]] = {
         "dir": "content/stacks",
         "unit": "One friction-removal setup page",
         "tone": "integration/config page",
+    },
+    "lesson": {
+        "dir": "content/learn",
+        "unit": "One structured course lesson",
+        "tone": "curriculum instruction page",
+    },
+    "log": {
+        "dir": "content/blog",
+        "unit": "One tested observation or sourced point of view",
+        "tone": "dated field report or narrative article",
+    },
+    "protocol": {
+        "dir": "content/prompts",
+        "unit": "One deterministic prompt contract",
+        "tone": "prompt/system instruction page",
     },
 }
 # Default model if none is provided via environment.
@@ -346,8 +359,8 @@ def short_preview(text: str, limit: int = 180) -> str:
     return f"{collapsed[: limit - 3].rstrip()}..."
 
 def section_type_from_content_path(path_value: str) -> Optional[str]:
-    """Given a blog content path like 'content/log/foo.md', return the
-    content type ('log').  Returns None if the path does not match any
+    """Given a blog content path like 'content/blog/foo.md', return the
+    content type ('blog').  Returns None if the path does not match any
     known section.
     """
     parts = Path(path_value).parts
@@ -359,14 +372,16 @@ def section_type_from_content_path(path_value: str) -> Optional[str]:
         return "workflow"
     if parts[1] == "artifacts":
         return "artifact"
-    if parts[1] == "log":
-        return "log"
-    if parts[1] == "reference":
+    if parts[1] in {"blog", "log"}:
+        return "blog"
+    if parts[1] in {"library", "reference"}:
         return "reference"
     if parts[1] == "stacks":
         return "stack"
-    if parts[1:3] == ("systems", "protocols"):
-        return "protocol"
+    if parts[1] == "prompts" or parts[1:3] == ("systems", "protocols"):
+        return "prompt"
+    if parts[1] == "learn":
+        return "lesson"
     return None
 
 def detect_git_root(start_path: Path) -> Optional[Path]:
@@ -1981,6 +1996,18 @@ class CyborgAgent:
         artifact_title = f"{repo_title} Command Sheet"
         project_title = repo_title
         reference_title = f"{repo_title} Reference Index"
+        blog_content = self.blog_root / "content"
+        use_blog_dir = (blog_content / "blog").is_dir() or not (blog_content / "log").is_dir()
+        log_type = "blog" if use_blog_dir else "log"
+        log_dir = "content/blog" if use_blog_dir else "content/log"
+
+        use_library_dir = (blog_content / "library").is_dir() or not (blog_content / "reference").is_dir()
+        ref_dir = "content/library" if use_library_dir else "content/reference"
+
+        use_prompts_dir = (blog_content / "prompts").is_dir() or not (blog_content / "systems" / "protocols").is_dir()
+        prompt_type = "prompt" if use_prompts_dir else "protocol"
+        prompt_dir = "content/prompts" if use_prompts_dir else "content/systems/protocols"
+
         items = [
             {
                 "key": "project",
@@ -2014,9 +2041,9 @@ class CyborgAgent:
             },
             {
                 "key": "log-main",
-                "type": "log",
+                "type": log_type,
                 "title": log_title,
-                "path": f"content/log/{repo_slug}-field-report.md",
+                "path": f"{log_dir}/{repo_slug}-field-report.md",
                 "why": "Narrative field report that captures why the repo matters, what changed, and how it performed in practice.",
                 "voice_mode": "log",
                 "depends_on": ["project"],
@@ -2029,7 +2056,7 @@ class CyborgAgent:
                     "key": "reference-main",
                     "type": "reference",
                     "title": reference_title,
-                    "path": f"content/reference/{repo_slug}-index.md",
+                    "path": f"{ref_dir}/{repo_slug}-index.md",
                     "why": "Lookup page that consolidates commands, files, or related pages for quick re-entry later.",
                     "voice_mode": "documentation",
                     "depends_on": ["workflow-main", "artifact-main"],
@@ -2053,9 +2080,9 @@ class CyborgAgent:
             items.append(
                 {
                     "key": "protocol-main",
-                    "type": "protocol",
+                    "type": prompt_type,
                     "title": f"{repo_title} Prompt Contract",
-                    "path": f"content/systems/protocols/{repo_slug}-prompt-contract.md",
+                    "path": f"{prompt_dir}/{repo_slug}-prompt-contract.md",
                     "why": "Prompt/system contract page extracted from prompt-heavy source material.",
                     "voice_mode": "documentation",
                     "depends_on": [],
@@ -3089,8 +3116,17 @@ class CyborgAgent:
                 continue
             value = fld.get("value", "")
             # Replace Hugo template date placeholders with today.
-            if name in {"date", "lastmod", "last_tested", "last_generated"}:
+            if name in {"date", "lastmod"}:
                 lines.append(f"{name}: {today}")
+            elif name == "last_tested":
+                # Physical execution evidence gate: never stamp today without explicit proof
+                if item.get("last_tested"):
+                    lines.append(f"last_tested: {item['last_tested']}")
+            elif name == "last_generated":
+                if item.get("last_generated"):
+                    lines.append(f"last_generated: {item['last_generated']}")
+                elif type_name == "artifact" and item.get("verified_generation"):
+                    lines.append(f"last_generated: {today}")
             elif name == "categories" and type_name == "workflow":
                 lines.append(f'categories: ["{self._infer_track()}"]')
             elif fld.get("is_list"):
@@ -3162,7 +3198,7 @@ class CyborgAgent:
                     'os: "macOS"',
                 ]
             )
-        elif type_name == "protocol":
+        elif type_name in {"protocol", "prompt"}:
             lines.extend(
                 [
                     'agent: "OpenRouter-Compatible"',
@@ -3175,19 +3211,24 @@ class CyborgAgent:
                 f"lastmod: {today}",
             ]
         )
-        if type_name in {"workflow", "project", "artifact", "stack", "protocol"}:
-            lines.append(f"last_tested: {today}")
-        if type_name == "artifact":
+        if item.get("last_tested"):
+            lines.append(f"last_tested: {item['last_tested']}")
+        if item.get("last_generated"):
+            lines.append(f"last_generated: {item['last_generated']}")
+        elif type_name == "artifact" and item.get("verified_generation"):
             lines.append(f"last_generated: {today}")
         lines.append("draft: true")
         tags = {
             "project": ["project", "pipeline"],
             "workflow": ["workflow", "manual"],
             "artifact": ["artifact", "output", "proof-of-work"],
-            "log": ["log", "update"],
+            "blog": ["blog", "field-report"],
+            "log": ["blog", "field-report"],
             "reference": ["reference"],
             "stack": ["stack", "automation", "accessibility"],
-            "protocol": ["protocol", "agent-config"],
+            "prompt": ["prompt", "deterministic-contract"],
+            "protocol": ["prompt", "deterministic-contract"],
+            "lesson": ["learn", "course"],
         }.get(type_name, [type_name])
         lines.append("tags:")
         lines.extend(f"  - {tag}" for tag in tags)
